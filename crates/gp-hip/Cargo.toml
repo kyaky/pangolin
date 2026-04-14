@@ -10,3 +10,5 @@ description = "HIP (Host Information Profile) report generation"
 quick-xml = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
