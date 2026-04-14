@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gp-proto",
+    "crates/gp-auth",
+    "crates/gp-tunnel",
+    "crates/gp-openconnect-sys",
+    "crates/gp-hip",
+    "crates/gp-dns",
+    "crates/gp-route",
+    "crates/gp-config",
+    "bins/pgn",
+    "bins/pgn-auth-helper",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/pangolin-vpn/pangolin"
+homepage = "https://github.com/pangolin-vpn/pangolin"
+authors = ["Pangolin Contributors"]
+
+[workspace.dependencies]
+# Internal crates
+gp-proto = { path = "crates/gp-proto" }
+gp-auth = { path = "crates/gp-auth" }
+gp-tunnel = { path = "crates/gp-tunnel" }
+gp-openconnect-sys = { path = "crates/gp-openconnect-sys" }
+gp-hip = { path = "crates/gp-hip" }
+gp-dns = { path = "crates/gp-dns" }
+gp-route = { path = "crates/gp-route" }
+gp-config = { path = "crates/gp-config" }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP / TLS
+reqwest = { version = "0.12", features = ["rustls-tls", "json", "cookies", "blocking"] }
+rustls = "0.23"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+dialoguer = "0.11"
+indicatif = "0.17"
+console = "0.15"
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# XML
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Async trait
+async-trait = "0.1"
+
+# Credentials
+keyring = { version = "3", features = ["linux-native-sync-persistent"] }
+
+# Directories
+directories = "5"
+
+# Build deps
+bindgen = "0.70"
+pkg-config = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

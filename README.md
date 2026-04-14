@@ -1,0 +1,252 @@
+# Pangolin
+
+> A modern, headless-friendly GlobalProtect VPN client for Linux,
+> written in Rust.
+
+`pangolin` (CLI binary `pgn`) connects to Palo Alto Networks
+GlobalProtect VPN portals — including modern **Prisma Access**
+deployments that use cloud authentication — without needing a desktop
+environment, a graphical browser, or `vpn-slice`.
+
+> **Status: early development.** Phase 1 (auth → tunnel handshake) is
+> verified end-to-end against a real Prisma Access portal. Routing,
+> DNS, daemon mode, multi-portal management, HIP reports, and Windows
+> / macOS support are still in flight. See
+> [Roadmap](#roadmap) below.
+
+---
+
+## Why another GlobalProtect client?
+
+There are two main open-source options today:
+
+| | openconnect | yuezk/GlobalProtect-openconnect | **pangolin** |
+|---|---|---|---|
+| Tunnel | Native ESP/HTTPS | Native (via libopenconnect) | Native (via libopenconnect) |
+| SAML auth on a server (no display) | ❌ paste mode only | ❌ requires WebKitGTK window | ✅ **headless paste mode** |
+| Prisma Access cloud-auth (`globalprotectcallback:`) | ✅ | ✅ | ✅ |
+| Split tunnel without `vpn-slice` | ❌ | ❌ | ✅ **bundled, hostname-aware** |
+| CLI-first, daemon-friendly | ⚠️ | ⚠️ GUI-first | ✅ goal |
+| HIP report, multi-portal, native gp-route | partial | partial | 🚧 roadmap |
+
+The two things that already make `pangolin` worth using over the
+alternatives:
+
+1. **Headless SAML.** `pgn connect --auth-mode paste` starts a tiny
+   local HTTP server and walks you through completing SAML in *any*
+   browser on *any* machine (the SSH-port-forward case is a one-liner).
+   No display, no embedded WebKit, no `xvfb` workaround. The yuezk
+   client cannot do this — its `gpauth` is hard-coded to spawn a
+   webkit2gtk window.
+2. **Client-controlled split tunnel.** `pgn connect --only
+   10.0.0.0/8,intranet.example.com` resolves the hostnames before the
+   tunnel comes up, then installs *only* those routes through the VPN.
+   The default route is left untouched, so your SSH session (and
+   anything else not explicitly routed) keeps using your normal
+   network. No external `vpn-slice` install required.
+
+A graphical webview path is still available for users who prefer it
+(`--auth-mode webview`, default when you have a display).
+
+---
+
+## Install
+
+### From source
+
+You need:
+
+- Rust **1.80+** (2021 edition)
+- `libopenconnect-dev` ≥ 8.20 (with `--protocol=gp` support)
+- `libclang-dev` (for `bindgen`)
+- `libssl-dev`, `libdbus-1-dev`
+- For the optional `webview` SAML mode: `libwebkit2gtk-4.1-dev`,
+  `libgtk-3-dev`, plus a working display (X11, Wayland, or WSLg)
+
+Debian / Ubuntu:
+
+```bash
+sudo apt install -y libopenconnect-dev libclang-dev libssl-dev \
+    libdbus-1-dev libwebkit2gtk-4.1-dev libgtk-3-dev pkg-config
+```
+
+Fedora / RHEL:
+
+```bash
+sudo dnf install -y openconnect-devel clang-devel openssl-devel \
+    dbus-devel webkit2gtk4.1-devel gtk3-devel pkgconf-pkg-config
+```
+
+Then:
+
+```bash
+git clone https://github.com/kyaky/pangolin
+cd pangolin
+cargo build --release
+sudo install -m 0755 target/release/pgn /usr/local/bin/pgn
+```
+
+If you only need headless mode and want to skip the webview deps:
+
+```bash
+cargo build --release --no-default-features
+```
+
+---
+
+## Quick start
+
+### Headless (server / SSH / container)
+
+```bash
+sudo -E pgn connect vpn.example.com \
+    --auth-mode paste \
+    --only 10.0.0.0/8
+```
+
+`pgn` will print something like:
+
+```
+┌─ Pangolin — headless SAML authentication ─────────────────────────────────┐
+│  Open this URL in any browser (any machine):                              │
+│    http://127.0.0.1:29999/                                                │
+│                                                                           │
+│  Over SSH? Port-forward first:                                            │
+│    ssh -L 29999:localhost:29999 …                                         │
+│                                                                           │
+│  After login, paste the `globalprotectcallback:…` URL here:               │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+Open the printed URL on whatever machine has a browser, complete your
+identity provider's flow (Azure AD, Okta, Shibboleth, …), copy the
+final `globalprotectcallback:` URL out of the browser's address bar
+and paste it back into the terminal. The tunnel comes up with only
+`10.0.0.0/8` routed through the VPN — your SSH connection survives.
+
+### Desktop (graphical)
+
+```bash
+sudo -E pgn connect vpn.example.com
+```
+
+By default `pgn` opens a small WebKitGTK window for the SAML flow.
+
+### Full tunnel
+
+If you want every byte to go through the VPN, point at a real
+vpnc-script:
+
+```bash
+sudo -E pgn connect vpn.example.com \
+    --vpnc-script /etc/vpnc/vpnc-script
+```
+
+(install the `vpnc-scripts` package first).
+
+---
+
+## CLI reference (work in progress)
+
+```
+pgn connect [PORTAL] [OPTIONS]
+
+Options:
+  -u, --user <USER>             Username (rarely needed for SAML)
+      --passwd-on-stdin         Read password from stdin (non-SAML auth)
+      --os <OS>                 Reported OS: win | mac | linux (default: win)
+      --insecure                Accept invalid TLS certificates
+      --vpnc-script <PATH>      vpnc-compatible script for routes/DNS
+      --auth-mode <MODE>        webview | paste (default: webview)
+      --saml-port <PORT>        Local port for paste-mode HTTP server (29999)
+      --only <CIDR|IP|HOST>     Comma-separated split-tunnel targets
+```
+
+Other subcommands (`pgn status`, `pgn disconnect`) currently print a
+"not yet implemented" message — see the roadmap.
+
+---
+
+## How it works
+
+`pangolin` is a Cargo workspace. The interesting crates:
+
+| crate | what it does |
+|---|---|
+| `gp-proto` | GlobalProtect XML protocol types (no I/O) |
+| `gp-auth` | Authentication providers (`Password`, `SamlBrowser`, `SamlPaste`) and the HTTP client for portal/gateway login |
+| `gp-tunnel` | Safe wrapper around `libopenconnect`. Owns the VPN session lifecycle, cancellation via `openconnect_setup_cmd_pipe`, and a C trampoline for libopenconnect's variadic progress callback (stable Rust can't define one) |
+| `gp-openconnect-sys` | Raw bindgen FFI bindings + the C trampoline shim |
+| `gp-config`, `gp-hip`, `gp-dns`, `gp-route` | Currently mostly stubs — see the roadmap |
+| `bins/pgn` | The CLI, `tokio`-based |
+
+Architecture rule of thumb: **`libopenconnect` handles the tunnel,
+Rust handles everything else.** That includes authentication, portal
+config, gateway selection, HIP, route installation, and reconnect
+policy. We never reimplement ESP/UDP, never shell out to the
+`openconnect` binary, and never run a Python helper script.
+
+---
+
+## Roadmap
+
+### Phase 1 — done
+
+- Workspace scaffold + libopenconnect FFI
+- GP protocol types and XML parsing
+- Password + SAML (webview + paste) auth providers
+- Prisma Access `globalprotectcallback:` JWT capture
+- `pgn connect` end-to-end: prelogin → SAML → portal config → gateway
+  login → CSTP → TUN → DPD keepalives
+- Bundled minimal vpnc-script + `--only` split tunnel
+- Clean Ctrl-C cancellation via `openconnect_setup_cmd_pipe`
+
+### Phase 2 — next
+
+- `pgn status` / `pgn disconnect` via unix socket
+- HIP report generation (`gp-hip`)
+- Native route + DNS management (`gp-route` / `gp-dns`) — replace the
+  bundled vpnc-script entirely with rtnetlink + systemd-resolved /
+  resolvconf / direct backends, à la Tailscale
+- Multi-portal profiles (`pgn portal add`, `pgn portal use`)
+- Auto-reconnect with exponential backoff
+- systemd unit
+- Prometheus metrics endpoint
+
+### Phase 3 — differentiation
+
+- Okta headless auth (no browser, even for the IdP step)
+- Client certificate auth (PEM / PKCS#12)
+- FIDO2 / YubiKey
+- macOS, Windows
+- NetworkManager plugin
+
+---
+
+## Contributing
+
+Issues and PRs welcome. Before sending a patch:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+The project intentionally has very few dependencies — please justify
+new crates in the PR description.
+
+---
+
+## License
+
+Dual-licensed under either of:
+
+- Apache License 2.0 (see [LICENSE-APACHE](LICENSE-APACHE))
+- MIT License (see [LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+`pangolin` is not affiliated with, endorsed by, or sponsored by Palo
+Alto Networks. "GlobalProtect" and "Prisma Access" are trademarks of
+their respective owners.

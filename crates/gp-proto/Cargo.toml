@@ -1,0 +1,12 @@
+[package]
+name = "gp-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "GlobalProtect protocol types and XML parsing (no I/O)"
+
+[dependencies]
+serde = { workspace = true }
+quick-xml = { workspace = true }
+thiserror = { workspace = true }

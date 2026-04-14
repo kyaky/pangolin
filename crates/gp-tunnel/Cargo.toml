@@ -1,0 +1,14 @@
+[package]
+name = "gp-tunnel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tunnel management — safe wrapper around libopenconnect"
+
+[dependencies]
+gp-openconnect-sys = { workspace = true }
+gp-proto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"

@@ -1,0 +1,16 @@
+[package]
+name = "gp-openconnect-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Raw FFI bindings to libopenconnect"
+links = "openconnect"
+
+[dependencies]
+tracing = { workspace = true }
+
+[build-dependencies]
+bindgen = { workspace = true }
+pkg-config = { workspace = true }
+cc = "1"

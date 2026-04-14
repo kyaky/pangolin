@@ -1,0 +1,12 @@
+[package]
+name = "gp-hip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HIP (Host Information Profile) report generation"
+
+[dependencies]
+quick-xml = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
