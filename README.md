@@ -309,20 +309,34 @@ production portal before they can be called production-ready.
 
 ¹ Not yet exercised against a gateway that actually enforces HIP.
 
-### Phase 2b — next
+### Phase 2b — implemented
 
-- Application-level auto-reconnect state machine. The current
-  `--reconnect` flag bumps libopenconnect's internal reconnect
-  budget from 60 seconds to 10 minutes, which covers brief
-  blips. A full retry-after-libopenconnect-gives-up loop with
-  exponential backoff and re-auth on cookie expiry is the
-  next step. (`SessionState::Reconnecting` is already wired
-  into the IPC snapshot, ready to be flipped.)
+- ~~Application-level auto-reconnect state machine~~ ✅ When
+  `--reconnect` is on, pangolin now retries the tunnel up to 10
+  times with exponential backoff (5s → 10s → ... → 5min cap),
+  keeping the IPC control socket and metrics endpoint alive
+  across retries. State flips to `Reconnecting` during backoff
+  so `pgn status` reflects reality. Re-auth on cookie expiry
+  is the remaining sub-item (Phase 2c) — the current loop
+  re-uses the existing gateway cookie, which covers the common
+  case where libopenconnect's internal reconnect window was
+  simply too short.
 - ~~systemd unit~~ ✅ (template at `packaging/systemd/pangolin@.service`)
 - ~~Multi-instance parallel tunnels~~ ✅ (per-instance control
   sockets in `gp-ipc`, `pgn connect --instance <name>`, `pgn
   status --all`, `pgn disconnect --all`)
-- Prometheus metrics endpoint
+- ~~Prometheus metrics endpoint~~ ✅ (`pgn connect
+  --metrics-port 9100` exposes `pangolin_session_info`,
+  `pangolin_session_state`, `pangolin_session_uptime_seconds`,
+  `pangolin_reconnect_attempts_total`,
+  `pangolin_tunnel_restarts_total`, and more)
+
+### Phase 2c — next
+
+- Re-auth on cookie expiry for the auto-reconnect loop (gateway
+  cookie re-issue without asking the user to re-do SAML when
+  possible)
+- Metrics endpoint TLS (rustls-based) for off-host scrapes
 
 ### Phase 3 — differentiation
 

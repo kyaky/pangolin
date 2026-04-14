@@ -1,8 +1,24 @@
 //! `pgn` — Pangolin GlobalProtect VPN CLI.
 
+mod metrics;
+
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+
+/// Shared, interior-mutable tunnel state. The IPC server and the
+/// metrics renderer both read it; the reconnect state machine
+/// writes it (flipping `state` between `Connecting`, `Connected`,
+/// and `Reconnecting`, and updating `tun_ifname` / `local_ipv4` on
+/// each successful tunnel re-establishment).
+///
+/// `std::sync::RwLock` is load-bearing here: reads are hot (every
+/// `pgn status` / scrape), writes are rare (once per state change),
+/// and the lock is only ever held long enough to clone out the
+/// relevant fields — never across an `await`. A tokio RwLock would
+/// add async overhead for no benefit.
+type SharedBase = Arc<RwLock<StateSnapshotBase>>;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -175,6 +191,14 @@ enum Commands {
         /// `[A-Za-z0-9_-]{1,32}`.
         #[arg(long, short = 'i', env = "PANGOLIN_INSTANCE")]
         instance: Option<String>,
+
+        /// Expose a Prometheus metrics endpoint at
+        /// `http://<bind>:<PORT>/metrics` for this session.
+        /// Accepts either a bare port (`9100` → binds to
+        /// `127.0.0.1:9100`) or a full `host:port` (`0.0.0.0:9100`
+        /// to expose on all interfaces). Off by default.
+        #[arg(long, env = "PGN_METRICS_PORT", value_name = "PORT|HOST:PORT")]
+        metrics_port: Option<String>,
     },
 
     /// Disconnect from VPN.
@@ -246,6 +270,10 @@ enum PortalAction {
         /// budget instead of the 60-second default).
         #[arg(long)]
         reconnect: bool,
+        /// Prometheus metrics endpoint for this profile: bare
+        /// port (`9100`) or `host:port` (`0.0.0.0:9100`).
+        #[arg(long, value_name = "PORT|HOST:PORT")]
+        metrics_port: Option<String>,
     },
     /// Remove a saved portal profile.
     Rm {
@@ -291,6 +319,7 @@ async fn main() -> Result<()> {
             hip,
             reconnect,
             instance,
+            metrics_port,
         }) => {
             connect(ConnectArgs {
                 portal,
@@ -305,6 +334,7 @@ async fn main() -> Result<()> {
                 hip,
                 reconnect,
                 instance,
+                metrics_port,
             })
             .await
         }
@@ -335,7 +365,14 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             vpnc_script,
             insecure,
             reconnect,
+            metrics_port,
         } => {
+            // Validate the metrics spec up front so bad profile
+            // saves fail fast instead of blowing up at `pgn
+            // connect` time.
+            if let Some(spec) = metrics_port.as_deref() {
+                parse_metrics_bind(spec)?;
+            }
             let profile = gp_config::PortalProfile {
                 url,
                 username: user,
@@ -355,6 +392,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                 }),
                 insecure: if insecure { Some(true) } else { None },
                 reconnect: if reconnect { Some(true) } else { None },
+                metrics_port,
             };
             config.set_portal(name.clone(), profile);
             config.save_to(&path)?;
@@ -427,6 +465,25 @@ async fn portal_command(action: PortalAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parse a `--metrics-port` flag value into a concrete bind address.
+///
+/// Accepts two shapes:
+///
+/// * bare port (`9100`) → binds to `127.0.0.1:9100`. Loopback-only
+///   is the sane default because the scrape body carries portal,
+///   gateway, and user labels that aren't secrets but aren't things
+///   you want on the open internet either.
+/// * `host:port` (`0.0.0.0:9100`, `[::1]:9100`) → verbatim.
+fn parse_metrics_bind(spec: &str) -> Result<SocketAddr> {
+    let trimmed = spec.trim();
+    if let Ok(port) = trimmed.parse::<u16>() {
+        return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    trimmed
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid --metrics-port value {trimmed:?}"))
 }
 
 /// Wait for any shutdown signal — `Ctrl-C` OR `SIGTERM`. Returns the
@@ -781,6 +838,7 @@ struct ConnectArgs {
     hip: Option<HipMode>,
     reconnect: Option<bool>,
     instance: Option<String>,
+    metrics_port: Option<String>,
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -797,9 +855,11 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         hip,
         reconnect,
         instance,
+        metrics_port,
     } = args;
 
     let instance_name = resolve_instance_name(instance)?;
+    let metrics_counters = metrics::MetricsCounters::new();
 
     // 1. Load config + resolve CLI args against the profile layer.
     let config = gp_config::PangolinConfig::load().context("loading config")?;
@@ -815,6 +875,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             only,
             hip,
             reconnect,
+            metrics_port,
         },
         &config,
     )?;
@@ -830,6 +891,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         insecure,
         reconnect,
         user: merged_user,
+        metrics_bind: metrics_bind_addr,
     } = resolved;
 
     // `user` was previously a plain ConnectArgs field; it's now
@@ -1053,100 +1115,22 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     };
 
     tracing::info!(
-        "starting tunnel: gateway={gateway_host} os={oc_os} vpnc_script={:?} native_routes={}",
+        "starting tunnel: gateway={gateway_host} os={oc_os} vpnc_script={:?} native_routes={} reconnect={reconnect}",
         script,
         routes.len()
     );
 
-    // Channels used by `run_tunnel` to talk back to us:
-    //  * `cancel_rx` receives the CancelHandle as soon as the session
-    //    is created — available before any blocking work so Ctrl-C
-    //    can interrupt the CSTP / setup_tun path.
-    //  * `ready_rx` receives a TunnelReady once setup_tun_device has
-    //    succeeded — carries the tun ifname + libopenconnect's ip_info.
-    //  * `done_rx` receives the tunnel thread's final Result.
-    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<TunnelReady>();
-    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
-
-    let split_routes = routes.clone();
-    let tunnel_thread = std::thread::Builder::new()
-        .name("pgn-tunnel".into())
-        .spawn(move || {
-            let result = run_tunnel(
-                &gateway_host,
-                &cookie_str,
-                oc_os,
-                script.as_deref(),
-                split_routes,
-                reconnect,
-                cancel_tx,
-                ready_tx,
-            );
-            let _ = done_tx.send(result);
-        })
-        .context("spawning tunnel thread")?;
-
-    // 9. Wait for the cancel handle. If the tunnel thread failed before
-    //    even getting this far, `recv` returns Err and we propagate via
-    //    the `done_rx` path below.
-    let cancel_handle = match cancel_rx.recv() {
-        Ok(c) => c,
-        Err(_) => {
-            // The tunnel thread exited before sending the cancel handle.
-            // Pick up its error from done_rx.
-            let _ = tunnel_thread.join();
-            done_rx
-                .await
-                .context("tunnel thread died without reporting a result")??;
-            return Ok(());
-        }
-    };
-
-    // 10. Wait for setup_tun_device to finish, then spawn the IPC server
-    //     with the real ifname / local IP. `recv_timeout` on a blocking
-    //     channel from inside a tokio task is awkward, so we race a
-    //     `spawn_blocking` call against ctrl_c and done_rx.
-    let tunnel_ready = tokio::select! {
-        res = tokio::task::spawn_blocking(move || ready_rx.recv()) => {
-            match res {
-                Ok(Ok(ready)) => ready,
-                Ok(Err(_)) | Err(_) => {
-                    // Tunnel thread failed before setup_tun_device finished.
-                    done_rx.await.context("tunnel thread did not report exit")??;
-                    let _ = tunnel_thread.join();
-                    return Ok(());
-                }
-            }
-        }
-        sig = shutdown_signal() => {
-            tracing::info!("{sig} received during tunnel setup, cancelling...");
-            if let Err(e) = cancel_handle.cancel() {
-                tracing::warn!("cancel failed: {e}");
-            }
-            done_rx.await.context("tunnel thread did not report exit")??;
-            let _ = tunnel_thread.join();
-            return Ok(());
-        }
-        res = &mut done_rx => {
-            let _ = tunnel_thread.join();
-            return match res {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!("tunnel thread panicked")),
-            };
-        }
-    };
-
-    // 11. Build the IPC state snapshot from auth info + tunnel state.
-    //     `started_at_unix` is captured ONCE here so subsequent NTP
-    //     steps or manual wall-clock changes don't make `pgn status`
-    //     report a drifting start time.
+    // Build the (shared, mutable) state base. Starts at `Connecting`;
+    // `run_tunnel_attempt` flips it to `Connected` when setup_tun_device
+    // succeeds, and the outer reconnect loop flips it back to
+    // `Reconnecting` between attempts. One `SharedBase` lives across
+    // the entire session so the IPC server and metrics endpoint see
+    // the current state regardless of reconnect churn.
     let started_at_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let local_ipv4 = tunnel_ready.ip_info.as_ref().and_then(|i| i.addr.clone());
-    let ipc_base = StateSnapshotBase {
+    let initial_base = StateSnapshotBase {
         instance: instance_name.clone(),
         portal: portal_url.clone(),
         gateway: gateway.address.clone(),
@@ -1154,61 +1138,394 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         reported_os: oc_os.to_string(),
         routes: routes.clone(),
         started_at_unix,
-        tun_ifname: tunnel_ready.ifname.clone(),
-        local_ipv4,
-        state: SessionState::Connected,
+        tun_ifname: None,
+        local_ipv4: None,
+        state: SessionState::Connecting,
     };
+    let base: SharedBase = Arc::new(RwLock::new(initial_base));
+
+    // Spawn the IPC server ONCE, outside the reconnect loop, so
+    // `pgn status` / `pgn disconnect` keep working across retry
+    // attempts. Disconnect uses a `watch::channel<bool>` — persistent,
+    // so a disconnect fired during attempt #1's backoff is still
+    // visible to attempt #2's subscribers.
     let ipc_start = Instant::now();
-    let (ipc_disconnect_tx, mut ipc_disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+    let (disconnect_tx, disconnect_rx) = tokio::sync::watch::channel(false);
     let ipc_socket_path = socket_path_for(&instance_name);
     let ipc_handle = spawn_ipc_server(
         ipc_socket_path.clone(),
-        Arc::new(ipc_base),
+        Arc::clone(&base),
         ipc_start,
-        ipc_disconnect_tx,
+        disconnect_tx,
     )
     .await
     .context("starting ipc server")?;
 
-    tracing::info!("tunnel running — press Ctrl-C (or `pgn disconnect`) to tear down");
+    // Optional Prometheus metrics endpoint — also lives across
+    // the reconnect loop so scrapers see counters tick up over
+    // time instead of resetting per attempt.
+    let metrics_handle = if let Some(addr) = metrics_bind_addr.as_ref() {
+        Some(
+            metrics::spawn_metrics_server(
+                *addr,
+                metrics::MetricsState {
+                    base: Arc::clone(&base),
+                    started_at: ipc_start,
+                    counters: Arc::clone(&metrics_counters),
+                },
+            )
+            .await
+            .context("starting metrics server")?,
+        )
+    } else {
+        None
+    };
 
-    // All three exit paths fall through to the same cleanup block. The
-    // `early_exit` slot captures the tunnel's own return value when
-    // `done_rx` wins the race, so the shared cleanup block can decide
-    // between "await done_rx" and "use what we already have".
-    let mut early_exit: Option<Result<()>> = None;
+    tracing::info!("tunnel starting — press Ctrl-C (or `pgn disconnect`) to tear down");
 
+    // Reconnect loop. The first iteration is the initial attempt;
+    // subsequent iterations fire only when `reconnect` is enabled AND
+    // the previous attempt exited with a non-user error.
+    //
+    // MVP scope: this loop re-uses the existing gateway authcookie
+    // across retries — good enough for the common case where
+    // libopenconnect's mainloop exits due to a transient network
+    // event that outlasts its internal 10-minute budget. Full re-auth
+    // on cookie expiry (re-running prelogin + SAML) is Phase 2c.
+    // If the cookie has gone stale server-side, retries will fail
+    // fast and the loop will eventually give up at `max_reconnect_attempts`.
+    const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+
+    let mut attempt_num: u32 = 0;
+    let final_result: Result<()> = 'outer: loop {
+        set_base_state(&base, SessionState::Connecting);
+
+        let outcome = run_tunnel_attempt(TunnelAttemptArgs {
+            gateway_host: &gateway_host,
+            cookie: &cookie_str,
+            os: oc_os,
+            script: script.as_deref(),
+            routes: routes.clone(),
+            reconnect_enabled: reconnect,
+            base: &base,
+            disconnect_rx: disconnect_rx.clone(),
+            counters: &metrics_counters,
+            attempt_num,
+        })
+        .await;
+
+        // Disconnect request always wins: if the user asked to tear
+        // down, we break even if the tunnel had just exited
+        // successfully or with an error we'd normally retry.
+        if *disconnect_rx.borrow() {
+            break 'outer Ok(());
+        }
+
+        match outcome {
+            AttemptOutcome::UserCancel => break 'outer Ok(()),
+            AttemptOutcome::Ok => break 'outer Ok(()),
+            AttemptOutcome::Err(e) if !reconnect => break 'outer Err(e),
+            AttemptOutcome::Err(e) => {
+                attempt_num += 1;
+                metrics_counters
+                    .reconnect_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if attempt_num >= MAX_RECONNECT_ATTEMPTS {
+                    break 'outer Err(e.context(format!(
+                        "giving up after {MAX_RECONNECT_ATTEMPTS} reconnect attempts"
+                    )));
+                }
+                tracing::warn!("tunnel exited: {e:#}");
+
+                set_base_state(&base, SessionState::Reconnecting);
+                // Clear stale tun info — the old interface is gone,
+                // the new one (if any) carries a fresh name.
+                {
+                    let mut guard = base.write().expect("SharedBase RwLock poisoned");
+                    guard.tun_ifname = None;
+                    guard.local_ipv4 = None;
+                }
+
+                let delay = reconnect_backoff(attempt_num);
+                tracing::info!(
+                    "reconnecting in {}s (attempt #{})",
+                    delay.as_secs(),
+                    attempt_num + 1
+                );
+
+                // Race the backoff against shutdown signals and
+                // `pgn disconnect`. Any of those three wake the
+                // outer loop out of the sleep; shutdown / disconnect
+                // break out for good, timer expiry continues.
+                let mut dr = disconnect_rx.clone();
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    sig = shutdown_signal() => {
+                        tracing::info!("{sig} during backoff, aborting reconnect");
+                        break 'outer Ok(());
+                    }
+                    _ = dr.wait_for(|v| *v) => {
+                        tracing::info!("disconnect during backoff, aborting reconnect");
+                        break 'outer Ok(());
+                    }
+                }
+            }
+        }
+    };
+
+    // Unified cleanup regardless of how we exited the loop.
+    ipc_handle.abort();
+    if let Some(h) = metrics_handle.as_ref() {
+        h.abort();
+    }
+    let _ = std::fs::remove_file(&ipc_socket_path);
+
+    final_result
+}
+
+/// Outcome of one `run_tunnel_attempt` iteration. The reconnect loop
+/// reads this + the watch-channel disconnect flag to decide whether
+/// to retry, break cleanly, or surface an error.
+enum AttemptOutcome {
+    /// User cancelled (Ctrl-C, SIGTERM, or `pgn disconnect`). Always
+    /// breaks the outer loop — no retry.
+    UserCancel,
+    /// Tunnel mainloop returned cleanly. Treated as a clean exit:
+    /// no retry, no error.
+    Ok,
+    /// Tunnel exited with an error. The outer loop decides between
+    /// retry (if `--reconnect` is on and we're under the max) and
+    /// surfacing the error.
+    Err(anyhow::Error),
+}
+
+/// Packed argument set for [`run_tunnel_attempt`]. A struct is used
+/// so the call site stays readable even with ~10 parameters.
+struct TunnelAttemptArgs<'a> {
+    gateway_host: &'a str,
+    cookie: &'a str,
+    os: &'static str,
+    script: Option<&'a str>,
+    routes: Vec<String>,
+    reconnect_enabled: bool,
+    base: &'a SharedBase,
+    disconnect_rx: tokio::sync::watch::Receiver<bool>,
+    counters: &'a Arc<metrics::MetricsCounters>,
+    attempt_num: u32,
+}
+
+/// Run one tunnel attempt end-to-end: spawn the libopenconnect thread,
+/// wait for the cancel handle + ready signal, publish the tun ifname
+/// to the shared state, then race the mainloop against shutdown
+/// signals and `pgn disconnect`.
+///
+/// Every attempt gets a fresh tunnel thread, fresh cancel handle,
+/// and fresh mpsc channels. The reconnect loop calls this repeatedly
+/// with the same cookie/host — network blips long enough to exit
+/// libopenconnect's internal reconnect budget are the primary
+/// motivation.
+async fn run_tunnel_attempt<'a>(args: TunnelAttemptArgs<'a>) -> AttemptOutcome {
+    let TunnelAttemptArgs {
+        gateway_host,
+        cookie,
+        os,
+        script,
+        routes,
+        reconnect_enabled,
+        base,
+        mut disconnect_rx,
+        counters,
+        attempt_num,
+    } = args;
+
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<TunnelReady>();
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
+
+    let gateway_owned = gateway_host.to_string();
+    let cookie_owned = cookie.to_string();
+    let script_owned = script.map(|s| s.to_string());
+    let routes_for_thread = routes;
+    let tunnel_thread =
+        match std::thread::Builder::new()
+            .name("pgn-tunnel".into())
+            .spawn(move || {
+                let result = run_tunnel(
+                    &gateway_owned,
+                    &cookie_owned,
+                    os,
+                    script_owned.as_deref(),
+                    routes_for_thread,
+                    reconnect_enabled,
+                    cancel_tx,
+                    ready_tx,
+                );
+                let _ = done_tx.send(result);
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                return AttemptOutcome::Err(anyhow::anyhow!(e).context("spawning tunnel thread"))
+            }
+        };
+
+    // Wait for the CancelHandle. The tunnel thread sends it before
+    // any blocking work, so this normally returns immediately.
+    let cancel_handle = match cancel_rx.recv() {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = tunnel_thread.join();
+            return match done_rx.await {
+                Ok(Ok(())) => AttemptOutcome::Ok,
+                Ok(Err(e)) => AttemptOutcome::Err(e),
+                Err(_) => AttemptOutcome::Err(anyhow::anyhow!(
+                    "tunnel thread died without reporting a result"
+                )),
+            };
+        }
+    };
+
+    // Wait for setup_tun_device. Race against shutdown signals, the
+    // disconnect watch channel, and the thread's own done_rx (in
+    // case it failed mid-setup).
+    let tunnel_ready = {
+        let mut dr = disconnect_rx.clone();
+        tokio::select! {
+            res = tokio::task::spawn_blocking(move || ready_rx.recv()) => {
+                match res {
+                    Ok(Ok(ready)) => ready,
+                    Ok(Err(_)) | Err(_) => {
+                        let _ = tunnel_thread.join();
+                        return match done_rx.await {
+                            Ok(Ok(())) => AttemptOutcome::Ok,
+                            Ok(Err(e)) => AttemptOutcome::Err(e),
+                            Err(_) => AttemptOutcome::Err(anyhow::anyhow!("tunnel thread panicked")),
+                        };
+                    }
+                }
+            }
+            sig = shutdown_signal() => {
+                tracing::info!("{sig} received during tunnel setup, cancelling...");
+                if let Err(e) = cancel_handle.cancel() {
+                    tracing::warn!("cancel failed: {e}");
+                }
+                let _ = done_rx.await;
+                let _ = tunnel_thread.join();
+                return AttemptOutcome::UserCancel;
+            }
+            _ = dr.wait_for(|v| *v) => {
+                tracing::info!("disconnect received during tunnel setup, cancelling...");
+                if let Err(e) = cancel_handle.cancel() {
+                    tracing::warn!("cancel failed: {e}");
+                }
+                let _ = done_rx.await;
+                let _ = tunnel_thread.join();
+                return AttemptOutcome::UserCancel;
+            }
+            res = &mut done_rx => {
+                let _ = tunnel_thread.join();
+                return match res {
+                    Ok(Ok(())) => AttemptOutcome::Ok,
+                    Ok(Err(e)) => AttemptOutcome::Err(e),
+                    Err(_) => AttemptOutcome::Err(anyhow::anyhow!("tunnel thread panicked")),
+                };
+            }
+        }
+    };
+
+    // Setup succeeded: publish the tun info to the shared state and
+    // flip to Connected. On the first attempt the state was
+    // Connecting; on retries it was Reconnecting before we entered
+    // this attempt and Connecting at the start of this attempt.
+    {
+        let mut guard = base.write().expect("SharedBase RwLock poisoned");
+        guard.tun_ifname = tunnel_ready.ifname.clone();
+        guard.local_ipv4 = tunnel_ready.ip_info.as_ref().and_then(|i| i.addr.clone());
+        guard.state = SessionState::Connected;
+    }
+
+    // Attempts after the first represent a *successful re-establishment*.
+    // Bump the restart counter now — this is the post-handshake,
+    // post-setup_tun_device moment the metrics definition points at.
+    if attempt_num > 0 {
+        counters
+            .tunnel_restarts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            "tunnel re-established (attempt #{}, total restarts: {})",
+            attempt_num + 1,
+            counters
+                .tunnel_restarts
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    } else {
+        tracing::info!("tunnel running — press Ctrl-C (or `pgn disconnect`) to tear down");
+    }
+
+    // Steady-state: race the mainloop against shutdown, disconnect,
+    // and its own exit.
     tokio::select! {
         sig = shutdown_signal() => {
             tracing::info!("{sig} received, cancelling tunnel...");
             if let Err(e) = cancel_handle.cancel() {
                 tracing::warn!("cancel failed: {e}");
             }
+            let res = done_rx.await;
+            let _ = tunnel_thread.join();
+            match res {
+                Ok(Ok(())) | Ok(Err(_)) => AttemptOutcome::UserCancel,
+                Err(_) => AttemptOutcome::UserCancel,
+            }
         }
-        _ = &mut ipc_disconnect_rx => {
+        _ = disconnect_rx.wait_for(|v| *v) => {
             tracing::info!("disconnect request received via control socket, cancelling tunnel...");
             if let Err(e) = cancel_handle.cancel() {
                 tracing::warn!("cancel failed: {e}");
             }
+            let res = done_rx.await;
+            let _ = tunnel_thread.join();
+            match res {
+                Ok(Ok(())) | Ok(Err(_)) => AttemptOutcome::UserCancel,
+                Err(_) => AttemptOutcome::UserCancel,
+            }
         }
         res = &mut done_rx => {
-            early_exit = Some(match res {
-                Ok(r) => r,
-                Err(_) => Err(anyhow::anyhow!("tunnel thread panicked")),
-            });
+            let _ = tunnel_thread.join();
+            match res {
+                Ok(Ok(())) => AttemptOutcome::Ok,
+                Ok(Err(e)) => AttemptOutcome::Err(e),
+                Err(_) => AttemptOutcome::Err(anyhow::anyhow!("tunnel thread panicked")),
+            }
         }
     }
+}
 
-    // Unified cleanup regardless of which arm fired.
-    ipc_handle.abort();
-    let _ = std::fs::remove_file(&ipc_socket_path);
+/// Compute the reconnect backoff for the Nth failed attempt. Uses a
+/// simple exponential curve with a 5-minute cap:
+///
+/// * attempt 1 → 5s
+/// * attempt 2 → 10s
+/// * attempt 3 → 20s
+/// * attempt 4 → 40s
+/// * attempt 5 → 80s
+/// * attempt 6 → 160s
+/// * attempt 7+ → 300s (capped)
+///
+/// No jitter — this isn't talking to a huge fleet of downstream
+/// peers, and predictable backoff is easier to reason about in logs
+/// and alerts.
+pub fn reconnect_backoff(attempt_num: u32) -> Duration {
+    const CAP_SECS: u64 = 300; // 5 minutes
+    let base_secs: u64 = 5u64
+        .checked_mul(1u64 << (attempt_num.saturating_sub(1)).min(6))
+        .unwrap_or(CAP_SECS);
+    Duration::from_secs(base_secs.min(CAP_SECS))
+}
 
-    let final_res = match early_exit {
-        Some(r) => r,
-        None => done_rx.await.context("tunnel thread did not report exit")?,
-    };
-    let _ = tunnel_thread.join();
-    final_res
+/// Helper: overwrite the session state in the shared base, holding
+/// the RwLock write guard for the shortest possible window.
+fn set_base_state(base: &SharedBase, state: SessionState) {
+    let mut guard = base.write().expect("SharedBase RwLock poisoned");
+    guard.state = state;
 }
 
 /// Parse a string-form auth mode (from a TOML profile's
@@ -1268,6 +1585,7 @@ struct CliConnectOverrides {
     only: Option<String>,
     hip: Option<HipMode>,
     reconnect: Option<bool>,
+    metrics_port: Option<String>,
 }
 
 /// Fully-resolved connection settings: every field is either the
@@ -1287,6 +1605,7 @@ struct ResolvedConnectSettings {
     hip: HipMode,
     insecure: bool,
     reconnect: bool,
+    metrics_bind: Option<SocketAddr>,
 }
 
 /// Pure function: merge `cli` on top of `config` to produce the
@@ -1374,6 +1693,12 @@ fn resolve_connect_settings(
         .user
         .or_else(|| profile.as_ref().and_then(|p| p.username.clone()));
 
+    let metrics_bind: Option<SocketAddr> = cli
+        .metrics_port
+        .or_else(|| profile.as_ref().and_then(|p| p.metrics_port.clone()))
+        .map(|spec| parse_metrics_bind(&spec))
+        .transpose()?;
+
     Ok(ResolvedConnectSettings {
         portal_url,
         cfg_user,
@@ -1386,6 +1711,7 @@ fn resolve_connect_settings(
         hip,
         insecure,
         reconnect,
+        metrics_bind,
     })
 }
 
@@ -1544,19 +1870,20 @@ fn build_openconnect_cookie(c: &AuthCookie) -> String {
 /// without firing again.
 async fn spawn_ipc_server(
     path: PathBuf,
-    base: Arc<StateSnapshotBase>,
+    base: SharedBase,
     started_at: Instant,
-    disconnect_tx: tokio::sync::oneshot::Sender<()>,
+    disconnect_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let listener = bind_server(&path)
         .await
         .with_context(|| format!("binding control socket at {}", path.display()))?;
     tracing::info!("control socket listening on {}", path.display());
 
-    // The disconnect sender is consumed on first use. `Arc<Mutex<Option<..>>>`
-    // lets multiple concurrent status requests coexist with an eventual
-    // single disconnect request without panicking.
-    let disconnect_tx = Arc::new(tokio::sync::Mutex::new(Some(disconnect_tx)));
+    // The disconnect sender is a `watch::Sender<bool>` — once we
+    // flip it to `true`, every reconnect-loop subscriber sees the
+    // flag on their next `wait_for`, so `pgn disconnect` correctly
+    // tears down both the current tunnel AND any pending retry.
+    let disconnect_tx = Arc::new(disconnect_tx);
 
     Ok(tokio::spawn(async move {
         loop {
@@ -1591,9 +1918,9 @@ const IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Handle one client connection: one request, one response, close.
 async fn handle_ipc_client(
     mut stream: tokio::net::UnixStream,
-    base: Arc<StateSnapshotBase>,
+    base: SharedBase,
     started_at: Instant,
-    disconnect_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    disconnect_tx: Arc<tokio::sync::watch::Sender<bool>>,
 ) -> Result<(), IpcError> {
     let req = match tokio::time::timeout(IPC_READ_TIMEOUT, read_request(&mut stream)).await {
         Ok(Ok(req)) => req,
@@ -1605,12 +1932,21 @@ async fn handle_ipc_client(
         }
     };
     let resp = match req {
-        IpcRequest::Status => IpcResponse::Status(build_snapshot(&base, started_at)),
+        IpcRequest::Status => {
+            // Short critical section: clone the base into a local
+            // so `build_snapshot` doesn't touch the lock across
+            // its string allocations. Guard is dropped at end of
+            // scope before `write_response`.
+            let snapshot_base = {
+                let guard = base.read().expect("SharedBase RwLock poisoned");
+                guard.clone()
+            };
+            IpcResponse::Status(build_snapshot(&snapshot_base, started_at))
+        }
         IpcRequest::Disconnect => {
-            let mut slot = disconnect_tx.lock().await;
-            if let Some(tx) = slot.take() {
-                let _ = tx.send(());
-            }
+            // Persistent: later reconnect-loop subscribers also see
+            // the flag. No consume-once problem.
+            let _ = disconnect_tx.send(true);
             IpcResponse::Ok
         }
     };
@@ -1989,6 +2325,7 @@ mod tests {
             only: None,
             hip: None,
             reconnect: None,
+            metrics_port: None,
         }
     }
 
@@ -2247,6 +2584,105 @@ mod tests {
             }
             _ => panic!("expected Commands::Connect"),
         }
+    }
+
+    // ---------- reconnect backoff curve ----------
+
+    #[test]
+    fn reconnect_backoff_doubles_per_attempt_up_to_cap() {
+        use std::time::Duration;
+        assert_eq!(reconnect_backoff(1), Duration::from_secs(5));
+        assert_eq!(reconnect_backoff(2), Duration::from_secs(10));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(20));
+        assert_eq!(reconnect_backoff(4), Duration::from_secs(40));
+        assert_eq!(reconnect_backoff(5), Duration::from_secs(80));
+        assert_eq!(reconnect_backoff(6), Duration::from_secs(160));
+        // Attempt 7 = 5 * 2^6 = 320 → capped at 300.
+        assert_eq!(reconnect_backoff(7), Duration::from_secs(300));
+        assert_eq!(reconnect_backoff(8), Duration::from_secs(300));
+        assert_eq!(reconnect_backoff(100), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn reconnect_backoff_attempt_zero_treated_as_one() {
+        // Defensive: callers number attempts from 1 but we don't
+        // want a panic on a stray `reconnect_backoff(0)` either.
+        use std::time::Duration;
+        assert_eq!(reconnect_backoff(0), Duration::from_secs(5));
+    }
+
+    // ---------- --metrics-port parsing ----------
+
+    #[test]
+    fn metrics_bind_bare_port_defaults_to_loopback() {
+        let addr = parse_metrics_bind("9100").unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:9100");
+    }
+
+    #[test]
+    fn metrics_bind_accepts_explicit_host_port() {
+        let addr = parse_metrics_bind("0.0.0.0:9100").unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:9100");
+        let addr = parse_metrics_bind("[::1]:9100").unwrap();
+        assert_eq!(addr.to_string(), "[::1]:9100");
+    }
+
+    #[test]
+    fn metrics_bind_rejects_garbage() {
+        assert!(parse_metrics_bind("not-a-port").is_err());
+        assert!(parse_metrics_bind("9100:extra:junk").is_err());
+        assert!(parse_metrics_bind("").is_err());
+    }
+
+    #[test]
+    fn resolve_metrics_port_cli_overrides_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                metrics_port: Some("9100".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let overrides = CliConnectOverrides {
+            metrics_port: Some("0.0.0.0:9300".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert_eq!(r.metrics_bind.unwrap().to_string(), "0.0.0.0:9300");
+    }
+
+    #[test]
+    fn resolve_metrics_port_inherits_from_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                metrics_port: Some("9100".into()),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert_eq!(r.metrics_bind.unwrap().to_string(), "127.0.0.1:9100");
+    }
+
+    #[test]
+    fn resolve_metrics_port_default_is_none() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert!(r.metrics_bind.is_none());
     }
 
     // ---------- instance-name validation ----------

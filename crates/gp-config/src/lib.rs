@@ -155,6 +155,12 @@ pub struct PortalProfile {
     /// See `pgn connect --reconnect` for the full semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconnect: Option<bool>,
+
+    /// Prometheus metrics endpoint spec. Matches the `--metrics-port`
+    /// flag format: either a bare port (`"9100"`) or a full
+    /// `host:port` (`"0.0.0.0:9100"`). Off when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_port: Option<String>,
 }
 
 fn default_os() -> String {
