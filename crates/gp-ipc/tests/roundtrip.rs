@@ -209,6 +209,79 @@ async fn enumerate_live_instances_finds_live_skips_stale() {
 }
 
 #[tokio::test]
+async fn client_roundtrip_times_out_on_wedged_server() {
+    // A server that accepts the connection but never reads or
+    // writes must not hang the client. The full-operation timeout
+    // is 5s; this test just needs to prove it fires.
+    let path = temp_socket("wedged");
+    let listener = UnixListener::bind(&path).expect("bind");
+
+    let server = tokio::spawn(async move {
+        // Accept once, then sit on the socket forever.
+        let (_stream, _) = listener.accept().await.expect("accept");
+        std::future::pending::<()>().await;
+    });
+
+    let start = std::time::Instant::now();
+    let result = client_roundtrip(&path, &Request::Status).await;
+    let elapsed = start.elapsed();
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        result.is_err(),
+        "wedged server must yield an error, got {result:?}"
+    );
+    // Must return within a bit more than CLIENT_REQUEST_TIMEOUT
+    // (5s) — definitely not hang indefinitely. Generous upper
+    // bound to avoid test flakes on a slow CI runner.
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "client_roundtrip took {elapsed:?} on a wedged server — timeout not firing"
+    );
+}
+
+#[tokio::test]
+async fn enumerate_live_instances_skips_non_socket_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "gp-ipc-filter-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A regular file with .sock extension — must NOT be probed
+    // (would race with connect returning ConnectionRefused).
+    let regular = dir.join("regular.sock");
+    std::fs::write(&regular, b"").unwrap();
+
+    // A subdirectory named *.sock — also must be skipped.
+    let dir_sock = dir.join("dir.sock");
+    std::fs::create_dir(&dir_sock).unwrap();
+
+    // And one actual live socket, so we have a positive control.
+    let live_path = dir.join("live.sock");
+    let _listener = bind_server(&live_path).await.expect("bind live");
+
+    let found = enumerate_live_instances(&dir).await;
+    let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["live"],
+        "only the live socket should be enumerated, got {names:?}"
+    );
+
+    let _ = std::fs::remove_file(&live_path);
+    let _ = std::fs::remove_file(&regular);
+    let _ = std::fs::remove_dir(&dir_sock);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[tokio::test]
 async fn started_at_unix_is_stable_across_queries() {
     // build_snapshot must read `started_at_unix` from the base rather
     // than derive it from the wall clock, so two consecutive snapshots

@@ -429,6 +429,36 @@ async fn portal_command(action: PortalAction) -> Result<()> {
     Ok(())
 }
 
+/// Wait for any shutdown signal — `Ctrl-C` OR `SIGTERM`. Returns the
+/// name of whichever fired first, so log lines can stay honest
+/// about what tore the tunnel down.
+///
+/// Both are treated equivalently: the caller routes either one into
+/// libopenconnect's cmd pipe for a clean cancel. Without this
+/// helper, `systemctl stop pangolin@work` would drop to SIGKILL
+/// after the stop timeout because there was no `SIGTERM` arm in
+/// the steady-state select block, and the tunnel would die
+/// ungracefully (routes/DNS state possibly leaked to the next
+/// session via systemd-resolved cache or `ip route` residue).
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            // On the (very rare) platform where installing a SIGTERM
+            // handler fails, degrade to Ctrl-C only and log — better
+            // than refusing to start.
+            tracing::warn!("installing SIGTERM handler failed: {e}; only Ctrl-C will cancel");
+            let _ = tokio::signal::ctrl_c().await;
+            return "Ctrl-C";
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "Ctrl-C",
+        _ = term.recv() => "SIGTERM",
+    }
+}
+
 /// Validate an instance name supplied via `--instance` / env.
 ///
 /// Instance names become filesystem path components (`<dir>/<name>.sock`),
@@ -514,15 +544,28 @@ fn print_snapshot_row(s: &gp_ipc::StateSnapshot) {
     );
 }
 
-/// Query every live instance in parallel and return their snapshots.
-/// Sockets that refuse connection mid-scan are silently skipped (the
-/// race window between enumerate and query is tiny; a session that
-/// tore down between calls is simply gone).
+/// Query every live instance concurrently and return their snapshots.
+/// Sockets that refuse connection mid-scan (session torn down between
+/// enumerate and query), or wedge past [`gp_ipc::CLIENT_REQUEST_TIMEOUT`],
+/// are silently skipped.
+///
+/// Concurrency is important here: a user with 5 instances running
+/// where one has gone unresponsive should still see the other 4 in
+/// `pgn status --all` within the request timeout, not 5 × that.
 async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
     let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
-    let mut out = Vec::with_capacity(live.len());
+    let mut set = tokio::task::JoinSet::new();
     for (_name, path) in live {
-        if let Ok(IpcResponse::Status(s)) = client_roundtrip(&path, &IpcRequest::Status).await {
+        set.spawn(async move {
+            match client_roundtrip(&path, &IpcRequest::Status).await {
+                Ok(IpcResponse::Status(s)) => Some(s),
+                _ => None,
+            }
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(s)) = joined {
             out.push(s);
         }
     }
@@ -581,15 +624,22 @@ async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
             Err(e) => Err(anyhow::anyhow!(e).context("querying pgn status")),
         }
     } else {
-        // Multi-instance scan.
+        // Multi-instance scan. JSON output is ALWAYS a (possibly
+        // empty) array when no explicit `--instance` was given — the
+        // shape stays stable regardless of live count so scripts
+        // never have to special-case 0/1/N. Human output still
+        // renders the friendly single-session block for the 1-live
+        // case and a table for 2+.
         let snapshots = collect_live_snapshots().await;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&snapshots).unwrap_or_else(|_| "[]".into())
+            );
+            return Ok(());
+        }
         if all || snapshots.len() >= 2 {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&snapshots).unwrap_or_else(|_| "[]".into())
-                );
-            } else if snapshots.is_empty() {
+            if snapshots.is_empty() {
                 println!("(no running pgn sessions)");
             } else {
                 println!(
@@ -603,24 +653,8 @@ async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
             return Ok(());
         }
         match snapshots.len() {
-            0 => {
-                if json {
-                    println!(r#"{{"state":"disconnected"}}"#);
-                } else {
-                    println!("state:     disconnected");
-                }
-            }
-            1 => {
-                let s = &snapshots[0];
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".into())
-                    );
-                } else {
-                    print_snapshot_human(s);
-                }
-            }
+            0 => println!("state:     disconnected"),
+            1 => print_snapshot_human(&snapshots[0]),
             _ => unreachable!("2+ case handled above"),
         }
         Ok(())
@@ -1085,8 +1119,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 }
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received during tunnel setup, cancelling...");
+        sig = shutdown_signal() => {
+            tracing::info!("{sig} received during tunnel setup, cancelling...");
             if let Err(e) = cancel_handle.cancel() {
                 tracing::warn!("cancel failed: {e}");
             }
@@ -1145,8 +1179,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     let mut early_exit: Option<Result<()>> = None;
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received, cancelling tunnel...");
+        sig = shutdown_signal() => {
+            tracing::info!("{sig} received, cancelling tunnel...");
             if let Err(e) = cancel_handle.cancel() {
                 tracing::warn!("cancel failed: {e}");
             }

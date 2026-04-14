@@ -42,6 +42,12 @@ pub const DEFAULT_INSTANCE: &str = "default";
 /// server is hung.
 pub const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long a single [`client_roundtrip`] is allowed to take end-to-end
+/// (connect + send + receive). Bounds the cost of a wedged server that
+/// accepts the connection but never writes a response — without this
+/// cap, the CLI would hang indefinitely waiting for the read side.
+pub const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Errors surfaced by the ipc client and server.
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -243,11 +249,24 @@ pub async fn bind_server(path: &Path) -> Result<UnixListener, IpcError> {
 /// Connect to a running session, send one request, receive one response.
 /// The connection is closed after the response is read.
 ///
-/// The initial `connect()` is bounded by [`CLIENT_CONNECT_TIMEOUT`]
-/// so a wedged peer can't hang the CLI — read/write after connect
-/// are not separately bounded, the server's own read timeout covers
-/// that side.
+/// Two timeouts apply:
+///
+/// * [`CLIENT_CONNECT_TIMEOUT`] bounds the initial `connect()` so a
+///   wedged peer (abandoned-but-bound socket) doesn't hang startup.
+/// * [`CLIENT_REQUEST_TIMEOUT`] bounds the full operation — connect
+///   plus send plus receive — so a server that accepts but never
+///   responds still lets the CLI return in a reasonable time.
 pub async fn client_roundtrip(path: &Path, req: &Request) -> Result<Response, IpcError> {
+    match tokio::time::timeout(CLIENT_REQUEST_TIMEOUT, client_roundtrip_inner(path, req)).await {
+        Ok(res) => res,
+        Err(_) => Err(IpcError::Protocol(format!(
+            "timed out talking to {}",
+            path.display()
+        ))),
+    }
+}
+
+async fn client_roundtrip_inner(path: &Path, req: &Request) -> Result<Response, IpcError> {
     let stream = match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(path)).await
     {
         Ok(Ok(s)) => s,
@@ -318,18 +337,60 @@ pub async fn write_response(stream: &mut UnixStream, resp: &Response) -> Result<
 /// `*.sock` entries. Returns a `Vec<(instance_name, path)>` of sockets
 /// that accepted a connection within [`CLIENT_CONNECT_TIMEOUT`]; stale
 /// and wedged sockets are silently skipped so `status --all` never
-/// hangs on a zombie. Permission-denied entries are also skipped —
-/// the CLI layer prints a hint if it gets zero hits while listing.
+/// hangs on a zombie.
+///
+/// * Only entries whose `file_type()` is actually a unix socket are
+///   probed — symlinks, regular files, and directories under that
+///   name are skipped. This both hardens against a hostile
+///   `/run/pangolin/*.sock` symlink and avoids paying the connect
+///   timeout for obvious junk.
+/// * `PermissionDenied` on a probe is logged at debug level rather
+///   than silently swallowed, so `sudo pgn status --all` on a half-
+///   broken install gives the operator a hint in `-v` / RUST_LOG.
+/// * Probes run **concurrently** via `FuturesUnordered` so a
+///   directory full of zombies only costs one timeout window, not
+///   N × timeout.
 pub async fn enumerate_live_instances(dir: &Path) -> Vec<(String, PathBuf)> {
+    use std::os::unix::fs::FileTypeExt;
+
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!("gp-ipc enumerate: read_dir({}) failed: {e}", dir.display());
+            }
+            return Vec::new();
+        }
     };
-    let mut candidates = Vec::new();
-    for entry in entries.flatten() {
+
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!("gp-ipc enumerate: dir entry error: {e}");
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("sock") {
             continue;
+        }
+        // Must be an actual unix socket — not a regular file, not a
+        // symlink (we'd follow to somewhere unexpected), not a dir.
+        // `file_type()` does not traverse symlinks, so a symlink
+        // under this name will report as `is_symlink()` and be
+        // skipped by the socket check.
+        match entry.file_type() {
+            Ok(ft) if ft.is_socket() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    "gp-ipc enumerate: file_type({}) failed: {e}",
+                    path.display()
+                );
+                continue;
+            }
         }
         let Some(name) = path
             .file_stem()
@@ -341,11 +402,33 @@ pub async fn enumerate_live_instances(dir: &Path) -> Vec<(String, PathBuf)> {
         candidates.push((name, path));
     }
 
-    let mut live = Vec::new();
+    // Probe every candidate concurrently — one shared timeout window,
+    // not N sequential ones. tokio::task::JoinSet is the stdlib-only
+    // way to run N independent futures in parallel and harvest them
+    // as they finish, without dragging in the futures crate.
+    let mut set = tokio::task::JoinSet::new();
     for (name, path) in candidates {
-        match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(&path)).await {
+        set.spawn(async move {
+            let outcome =
+                tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, UnixStream::connect(&path)).await;
+            (name, path, outcome)
+        });
+    }
+    let mut live = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        let (name, path, outcome) = match joined {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("gp-ipc enumerate: probe task panicked: {e}");
+                continue;
+            }
+        };
+        match outcome {
             Ok(Ok(_)) => live.push((name, path)),
-            Ok(Err(_)) | Err(_) => continue,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::debug!("gp-ipc enumerate: permission denied on {}", path.display());
+            }
+            Ok(Err(_)) | Err(_) => {}
         }
     }
     live.sort_by(|a, b| a.0.cmp(&b.0));
