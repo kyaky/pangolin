@@ -1853,10 +1853,13 @@ mod tests {
     }
 
     #[test]
-    fn insecure_space_separated_value_is_rejected() {
-        // `--insecure true` (space, not `=`) must be rejected with
-        // `require_equals`, otherwise we'd have the same positional-
-        // stealing bug in a slightly different guise.
+    fn insecure_space_separated_is_treated_as_positional() {
+        // With `require_equals = true`, the bare `--insecure` form
+        // does NOT consume the next CLI token as its value —
+        // instead, that token becomes the positional portal
+        // argument. This pins the current behaviour so a future
+        // `require_equals`-off refactor won't silently re-introduce
+        // the positional-stealing bug the previous commit fixed.
         use clap::Parser;
         let result = Cli::try_parse_from([
             "pgn",
