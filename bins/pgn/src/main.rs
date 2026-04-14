@@ -12,9 +12,9 @@ use gp_auth::{
     SamlPasteAuthProvider,
 };
 use gp_ipc::{
-    bind_server, build_snapshot, client_roundtrip, read_request, write_response, IpcError,
-    Request as IpcRequest, Response as IpcResponse, SessionState, StateSnapshotBase,
-    DEFAULT_SOCKET_PATH,
+    bind_server, build_snapshot, client_roundtrip, enumerate_live_instances, read_request,
+    socket_path_for, write_response, IpcError, Request as IpcRequest, Response as IpcResponse,
+    SessionState, StateSnapshotBase, DEFAULT_INSTANCE, DEFAULT_SOCKET_DIR,
 };
 use gp_proto::{AuthCookie, ClientOs, GatewayLoginResult, GpParams};
 use gp_tunnel::{IpInfoSnapshot, OpenConnectSession};
@@ -166,13 +166,43 @@ enum Commands {
             env = "PGN_RECONNECT"
         )]
         reconnect: Option<bool>,
+
+        /// Instance name for this session. Every running `pgn
+        /// connect` gets its own control socket at
+        /// `/run/pangolin/<instance>.sock`, so you can run
+        /// multiple tunnels side by side (e.g. one for work,
+        /// one for a client). Defaults to `default`. Must match
+        /// `[A-Za-z0-9_-]{1,32}`.
+        #[arg(long, short = 'i', env = "PANGOLIN_INSTANCE")]
+        instance: Option<String>,
     },
 
     /// Disconnect from VPN.
-    Disconnect,
+    Disconnect {
+        /// Target one instance by name. If omitted and exactly
+        /// one instance is live, that one is used. With two or
+        /// more live instances the command refuses rather than
+        /// guessing — pass `--instance <name>` or `--all`.
+        #[arg(long, short = 'i', env = "PANGOLIN_INSTANCE")]
+        instance: Option<String>,
+        /// Disconnect every live instance. Mutually exclusive
+        /// with `--instance`.
+        #[arg(long, conflicts_with = "instance")]
+        all: bool,
+    },
 
     /// Show connection status.
-    Status,
+    Status {
+        /// Target one instance by name. If omitted the command
+        /// prints the single live instance (0 → `disconnected`,
+        /// 1 → full status, 2+ → list all live instances).
+        #[arg(long, short = 'i', env = "PANGOLIN_INSTANCE")]
+        instance: Option<String>,
+        /// List every live instance even when only one is
+        /// running. Forces list-format output.
+        #[arg(long, conflicts_with = "instance")]
+        all: bool,
+    },
 
     /// Manage saved portal profiles.
     Portal {
@@ -260,6 +290,7 @@ async fn main() -> Result<()> {
             only,
             hip,
             reconnect,
+            instance,
         }) => {
             connect(ConnectArgs {
                 portal,
@@ -273,11 +304,13 @@ async fn main() -> Result<()> {
                 only,
                 hip,
                 reconnect,
+                instance,
             })
             .await
         }
-        Some(Commands::Disconnect) => disconnect(cli.json).await,
-        Some(Commands::Status) | None => status(cli.json).await,
+        Some(Commands::Disconnect { instance, all }) => disconnect(cli.json, instance, all).await,
+        Some(Commands::Status { instance, all }) => status(cli.json, instance, all).await,
+        None => status(cli.json, None, false).await,
         Some(Commands::Portal { action }) => portal_command(action).await,
     }
 }
@@ -396,96 +429,260 @@ async fn portal_command(action: PortalAction) -> Result<()> {
     Ok(())
 }
 
-/// Where the running session keeps its control socket. Currently a
-/// hard-coded path; switch to reading a `PGN_CONTROL_SOCKET` env var
-/// if a per-user override is ever needed.
-fn control_socket_path() -> PathBuf {
-    PathBuf::from(DEFAULT_SOCKET_PATH)
+/// Validate an instance name supplied via `--instance` / env.
+///
+/// Instance names become filesystem path components (`<dir>/<name>.sock`),
+/// systemd unit instance names, and part of log lines. Restrict to
+/// `[A-Za-z0-9_-]{1,32}` so nobody can accidentally embed a `/`, a
+/// `..`, shell metacharacters, or whitespace.
+fn validate_instance_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 32 {
+        anyhow::bail!(
+            "instance name must be 1..=32 characters (got {} chars: {:?})",
+            name.len(),
+            name
+        );
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "instance name {name:?} contains an invalid character \
+             (allowed: A-Z a-z 0-9 '_' '-')"
+        );
+    }
+    Ok(())
 }
 
-/// `pgn status` — query the running session (if any) and pretty-print.
-async fn status(json: bool) -> Result<()> {
-    let path = control_socket_path();
-    match client_roundtrip(&path, &IpcRequest::Status).await {
-        Ok(IpcResponse::Status(s)) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&s).unwrap_or_else(|_| "{}".into())
-                );
-            } else {
-                let mins = s.uptime_seconds / 60;
-                let secs = s.uptime_seconds % 60;
-                let state_str = match s.state {
-                    SessionState::Connected => "connected",
-                    SessionState::Connecting => "connecting",
-                    SessionState::Reconnecting => "reconnecting",
-                };
-                println!("state:     {state_str}");
-                println!("portal:    {}", s.portal);
-                println!("gateway:   {}", s.gateway);
-                println!("user:      {}", s.user);
-                println!("os-spoof:  {}", s.reported_os);
-                println!("uptime:    {}m{}s", mins, secs);
-                println!(
-                    "interface: {}",
-                    s.tun_ifname.as_deref().unwrap_or("(unknown)")
-                );
-                println!(
-                    "local-ip:  {}",
-                    s.local_ipv4.as_deref().unwrap_or("(none)")
-                );
-                if s.routes.is_empty() {
-                    println!("routes:    (default — script-managed)");
-                } else {
-                    println!("routes:    {}", s.routes.join(", "));
-                }
-            }
-            Ok(())
-        }
-        Ok(IpcResponse::Error { message }) => {
-            anyhow::bail!("server error: {message}");
-        }
-        Ok(IpcResponse::Ok) => {
-            anyhow::bail!("server returned Ok to a Status request — protocol bug");
-        }
-        Err(IpcError::NotRunning(_)) => {
-            if json {
-                println!(r#"{{"state":"disconnected"}}"#);
-            } else {
-                println!("state:     disconnected");
-            }
-            Ok(())
-        }
-        Err(IpcError::PermissionDenied(_)) => {
-            anyhow::bail!(
-                "control socket exists but you don't have permission to read it — \
-                 try `sudo pgn status`"
-            );
-        }
-        Err(e) => Err(anyhow::anyhow!(e).context("querying pgn status")),
+/// Resolve a `--instance` flag to the concrete name used for the
+/// control socket. `None` becomes [`DEFAULT_INSTANCE`].
+fn resolve_instance_name(instance: Option<String>) -> Result<String> {
+    let name = instance.unwrap_or_else(|| DEFAULT_INSTANCE.to_string());
+    validate_instance_name(&name)?;
+    Ok(name)
+}
+
+/// Pretty-print one [`StateSnapshot`] in the classic human-readable
+/// format used by the single-instance `pgn status`.
+fn print_snapshot_human(s: &gp_ipc::StateSnapshot) {
+    let mins = s.uptime_seconds / 60;
+    let secs = s.uptime_seconds % 60;
+    let state_str = match s.state {
+        SessionState::Connected => "connected",
+        SessionState::Connecting => "connecting",
+        SessionState::Reconnecting => "reconnecting",
+    };
+    println!("instance:  {}", s.instance);
+    println!("state:     {state_str}");
+    println!("portal:    {}", s.portal);
+    println!("gateway:   {}", s.gateway);
+    println!("user:      {}", s.user);
+    println!("os-spoof:  {}", s.reported_os);
+    println!("uptime:    {}m{}s", mins, secs);
+    println!(
+        "interface: {}",
+        s.tun_ifname.as_deref().unwrap_or("(unknown)")
+    );
+    println!("local-ip:  {}", s.local_ipv4.as_deref().unwrap_or("(none)"));
+    if s.routes.is_empty() {
+        println!("routes:    (default — script-managed)");
+    } else {
+        println!("routes:    {}", s.routes.join(", "));
     }
 }
 
-/// `pgn disconnect` — ask the running session to tear down.
-async fn disconnect(json: bool) -> Result<()> {
-    let path = control_socket_path();
-    match client_roundtrip(&path, &IpcRequest::Disconnect).await {
-        Ok(IpcResponse::Ok) => {
-            if json {
-                println!(r#"{{"result":"disconnect-requested"}}"#);
-            } else {
-                println!("disconnect requested");
+/// One-line summary row for the multi-instance list view.
+fn print_snapshot_row(s: &gp_ipc::StateSnapshot) {
+    let state_str = match s.state {
+        SessionState::Connected => "connected",
+        SessionState::Connecting => "connecting",
+        SessionState::Reconnecting => "reconnecting",
+    };
+    let mins = s.uptime_seconds / 60;
+    let secs = s.uptime_seconds % 60;
+    let iface = s.tun_ifname.as_deref().unwrap_or("-");
+    let ip = s.local_ipv4.as_deref().unwrap_or("-");
+    println!(
+        "{name:<16} {state:<12} {iface:<8} {ip:<16} {mins}m{secs}s",
+        name = s.instance,
+        state = state_str,
+        iface = iface,
+        ip = ip,
+        mins = mins,
+        secs = secs,
+    );
+}
+
+/// Query every live instance in parallel and return their snapshots.
+/// Sockets that refuse connection mid-scan are silently skipped (the
+/// race window between enumerate and query is tiny; a session that
+/// tore down between calls is simply gone).
+async fn collect_live_snapshots() -> Vec<gp_ipc::StateSnapshot> {
+    let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
+    let mut out = Vec::with_capacity(live.len());
+    for (_name, path) in live {
+        if let Ok(IpcResponse::Status(s)) = client_roundtrip(&path, &IpcRequest::Status).await {
+            out.push(s);
+        }
+    }
+    out.sort_by(|a, b| a.instance.cmp(&b.instance));
+    out
+}
+
+/// `pgn status` — query the running session(s) and pretty-print.
+///
+/// Behavior:
+///
+/// * `--instance <name>` → hit exactly that socket; error if missing.
+/// * `--all` → always list every live instance.
+/// * no flags → 0 live: disconnected; 1 live: full details;
+///   2+ live: list view (forces the user to be explicit with
+///   disconnect).
+///
+/// JSON mode always emits an array for list-form calls and a stable
+/// shape for single-form calls: `{"state":"disconnected"}` when
+/// nothing is running (without `--all`), or the snapshot object.
+/// With `--all` the JSON shape is always an array, even for zero
+/// or one live instance.
+async fn status(json: bool, instance: Option<String>, all: bool) -> Result<()> {
+    // Single-instance query.
+    if let Some(raw) = instance {
+        validate_instance_name(&raw)?;
+        let path = socket_path_for(&raw);
+        match client_roundtrip(&path, &IpcRequest::Status).await {
+            Ok(IpcResponse::Status(s)) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&s).unwrap_or_else(|_| "{}".into())
+                    );
+                } else {
+                    print_snapshot_human(&s);
+                }
+                Ok(())
             }
-            Ok(())
+            Ok(IpcResponse::Error { message }) => anyhow::bail!("server error: {message}"),
+            Ok(IpcResponse::Ok) => {
+                anyhow::bail!("server returned Ok to a Status request — protocol bug")
+            }
+            Err(IpcError::NotRunning(_)) => {
+                if json {
+                    println!(r#"{{"state":"disconnected","instance":"{raw}"}}"#);
+                } else {
+                    println!("instance {raw:?}: disconnected");
+                }
+                Ok(())
+            }
+            Err(IpcError::PermissionDenied(_)) => anyhow::bail!(
+                "control socket exists but you don't have permission to read it — \
+                 try `sudo pgn status -i {raw}`"
+            ),
+            Err(e) => Err(anyhow::anyhow!(e).context("querying pgn status")),
         }
-        Ok(IpcResponse::Error { message }) => {
-            anyhow::bail!("server error: {message}");
+    } else {
+        // Multi-instance scan.
+        let snapshots = collect_live_snapshots().await;
+        if all || snapshots.len() >= 2 {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&snapshots).unwrap_or_else(|_| "[]".into())
+                );
+            } else if snapshots.is_empty() {
+                println!("(no running pgn sessions)");
+            } else {
+                println!(
+                    "{:<16} {:<12} {:<8} {:<16} uptime",
+                    "INSTANCE", "STATE", "IFACE", "LOCAL-IP"
+                );
+                for s in &snapshots {
+                    print_snapshot_row(s);
+                }
+            }
+            return Ok(());
         }
-        Ok(IpcResponse::Status(_)) => {
-            anyhow::bail!("server returned Status to a Disconnect request — protocol bug");
+        match snapshots.len() {
+            0 => {
+                if json {
+                    println!(r#"{{"state":"disconnected"}}"#);
+                } else {
+                    println!("state:     disconnected");
+                }
+            }
+            1 => {
+                let s = &snapshots[0];
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".into())
+                    );
+                } else {
+                    print_snapshot_human(s);
+                }
+            }
+            _ => unreachable!("2+ case handled above"),
         }
-        Err(IpcError::NotRunning(_)) => {
+        Ok(())
+    }
+}
+
+/// `pgn disconnect` — ask a running session (or every running
+/// session) to tear down.
+async fn disconnect(json: bool, instance: Option<String>, all: bool) -> Result<()> {
+    // 1. Explicit --instance: classic single-target path.
+    if let Some(raw) = instance {
+        validate_instance_name(&raw)?;
+        return disconnect_single(json, &raw).await;
+    }
+
+    // 2. --all: hit every live instance. Refuses silently if none.
+    if all {
+        let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
+        if live.is_empty() {
+            if json {
+                println!(r#"{{"result":"not-running"}}"#);
+            } else {
+                println!("no running pgn sessions");
+            }
+            return Ok(());
+        }
+        let mut failures = Vec::new();
+        for (name, path) in &live {
+            match client_roundtrip(path, &IpcRequest::Disconnect).await {
+                Ok(IpcResponse::Ok) => {
+                    if !json {
+                        println!("{name}: disconnect requested");
+                    }
+                }
+                Ok(IpcResponse::Error { message }) => {
+                    failures.push(format!("{name}: server error: {message}"));
+                }
+                Ok(IpcResponse::Status(_)) => {
+                    failures.push(format!("{name}: protocol bug"));
+                }
+                // Benign: the session tore down between enumerate and now.
+                Err(IpcError::NotRunning(_)) => {}
+                Err(e) => failures.push(format!("{name}: {e}")),
+            }
+        }
+        if json {
+            let succeeded = live.len() - failures.len();
+            println!(
+                r#"{{"result":"disconnect-requested","count":{succeeded},"failures":{}}}"#,
+                failures.len()
+            );
+        }
+        if !failures.is_empty() {
+            anyhow::bail!("some instances failed: {}", failures.join("; "));
+        }
+        return Ok(());
+    }
+
+    // 3. No flags: try to be smart, but refuse if ambiguous.
+    let live = enumerate_live_instances(std::path::Path::new(DEFAULT_SOCKET_DIR)).await;
+    match live.len() {
+        0 => {
             if json {
                 println!(r#"{{"result":"not-running"}}"#);
             } else {
@@ -493,12 +690,46 @@ async fn disconnect(json: bool) -> Result<()> {
             }
             Ok(())
         }
-        Err(IpcError::PermissionDenied(_)) => {
+        1 => disconnect_single(json, &live[0].0).await,
+        _ => {
+            let names: Vec<&str> = live.iter().map(|(n, _)| n.as_str()).collect();
             anyhow::bail!(
-                "control socket exists but you don't have permission to read it — \
-                 try `sudo pgn disconnect`"
+                "{} live instances — pass --instance <name> or --all to pick one. \
+                 Live: {}",
+                live.len(),
+                names.join(", ")
             );
         }
+    }
+}
+
+async fn disconnect_single(json: bool, name: &str) -> Result<()> {
+    let path = socket_path_for(name);
+    match client_roundtrip(&path, &IpcRequest::Disconnect).await {
+        Ok(IpcResponse::Ok) => {
+            if json {
+                println!(r#"{{"result":"disconnect-requested","instance":"{name}"}}"#);
+            } else {
+                println!("{name}: disconnect requested");
+            }
+            Ok(())
+        }
+        Ok(IpcResponse::Error { message }) => anyhow::bail!("server error: {message}"),
+        Ok(IpcResponse::Status(_)) => {
+            anyhow::bail!("server returned Status to a Disconnect request — protocol bug")
+        }
+        Err(IpcError::NotRunning(_)) => {
+            if json {
+                println!(r#"{{"result":"not-running","instance":"{name}"}}"#);
+            } else {
+                println!("{name}: no running pgn session");
+            }
+            Ok(())
+        }
+        Err(IpcError::PermissionDenied(_)) => anyhow::bail!(
+            "control socket exists but you don't have permission to read it — \
+             try `sudo pgn disconnect -i {name}`"
+        ),
         Err(e) => Err(anyhow::anyhow!(e).context("requesting pgn disconnect")),
     }
 }
@@ -515,6 +746,7 @@ struct ConnectArgs {
     only: Option<String>,
     hip: Option<HipMode>,
     reconnect: Option<bool>,
+    instance: Option<String>,
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -530,7 +762,10 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         only,
         hip,
         reconnect,
+        instance,
     } = args;
+
+    let instance_name = resolve_instance_name(instance)?;
 
     // 1. Load config + resolve CLI args against the profile layer.
     let config = gp_config::PangolinConfig::load().context("loading config")?;
@@ -611,18 +846,14 @@ async fn connect(args: ConnectArgs) -> Result<()> {
 
     let cred = if prelogin.is_saml() {
         match auth_mode {
-            SamlAuthMode::Webview => {
-                SamlBrowserAuthProvider
-                    .authenticate(&prelogin, &auth_ctx)
-                    .await
-                    .context("SAML (webview) authentication")?
-            }
-            SamlAuthMode::Paste => {
-                SamlPasteAuthProvider::new(saml_port)
-                    .authenticate(&prelogin, &auth_ctx)
-                    .await
-                    .context("SAML (paste) authentication")?
-            }
+            SamlAuthMode::Webview => SamlBrowserAuthProvider
+                .authenticate(&prelogin, &auth_ctx)
+                .await
+                .context("SAML (webview) authentication")?,
+            SamlAuthMode::Paste => SamlPasteAuthProvider::new(saml_port)
+                .authenticate(&prelogin, &auth_ctx)
+                .await
+                .context("SAML (paste) authentication")?,
         }
     } else {
         PasswordAuthProvider
@@ -734,9 +965,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             if hip == HipMode::Force {
                 return Err(e.context("--hip=force: HIP flow failed, aborting connect"));
             } else {
-                tracing::warn!(
-                    "HIP flow non-fatal error (auto mode, continuing): {e:#}"
-                );
+                tracing::warn!("HIP flow non-fatal error (auto mode, continuing): {e:#}");
             }
         }
     }
@@ -882,11 +1111,9 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let local_ipv4 = tunnel_ready
-        .ip_info
-        .as_ref()
-        .and_then(|i| i.addr.clone());
+    let local_ipv4 = tunnel_ready.ip_info.as_ref().and_then(|i| i.addr.clone());
     let ipc_base = StateSnapshotBase {
+        instance: instance_name.clone(),
         portal: portal_url.clone(),
         gateway: gateway.address.clone(),
         user: auth_cookie.username.clone(),
@@ -898,9 +1125,8 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         state: SessionState::Connected,
     };
     let ipc_start = Instant::now();
-    let (ipc_disconnect_tx, mut ipc_disconnect_rx) =
-        tokio::sync::oneshot::channel::<()>();
-    let ipc_socket_path = control_socket_path();
+    let (ipc_disconnect_tx, mut ipc_disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+    let ipc_socket_path = socket_path_for(&instance_name);
     let ipc_handle = spawn_ipc_server(
         ipc_socket_path.clone(),
         Arc::new(ipc_base),
@@ -1684,10 +1910,7 @@ mod tests {
     #[test]
     fn civil_from_unix_new_years_2025() {
         // 2025-01-01 00:00:00 UTC = 1_735_689_600.
-        assert_eq!(
-            civil_from_unix(1_735_689_600),
-            (2025, 1, 1, 0, 0, 0)
-        );
+        assert_eq!(civil_from_unix(1_735_689_600), (2025, 1, 1, 0, 0, 0));
     }
 
     #[test]
@@ -1697,19 +1920,13 @@ mod tests {
         //   + 12h → 1_718_452_800
         //   + 34m → 1_718_454_840
         //   + 56s → 1_718_454_896
-        assert_eq!(
-            civil_from_unix(1_718_454_896),
-            (2024, 6, 15, 12, 34, 56)
-        );
+        assert_eq!(civil_from_unix(1_718_454_896), (2024, 6, 15, 12, 34, 56));
     }
 
     #[test]
     fn civil_from_unix_leap_day_2024() {
         // 2024-02-29 00:00:00 UTC = 1_709_164_800.
-        assert_eq!(
-            civil_from_unix(1_709_164_800),
-            (2024, 2, 29, 0, 0, 0)
-        );
+        assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29, 0, 0, 0));
     }
 
     #[test]
@@ -1880,18 +2097,11 @@ mod tests {
         // Now that `require_equals` is set, only `--insecure=…`
         // syntax can supply a value.
         use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "pgn",
-            "connect",
-            "--insecure",
-            "vpn.example.com",
-        ])
-        .expect("bare --insecure followed by positional must parse");
+        let cli = Cli::try_parse_from(["pgn", "connect", "--insecure", "vpn.example.com"])
+            .expect("bare --insecure followed by positional must parse");
         match cli.command {
             Some(Commands::Connect {
-                portal,
-                insecure,
-                ..
+                portal, insecure, ..
             }) => {
                 assert_eq!(portal.as_deref(), Some("vpn.example.com"));
                 // Bare --insecure → default_missing_value → Some(true)
@@ -1904,13 +2114,8 @@ mod tests {
     #[test]
     fn insecure_equals_false_parses() {
         use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "pgn",
-            "connect",
-            "--insecure=false",
-            "vpn.example.com",
-        ])
-        .expect("--insecure=false must parse");
+        let cli = Cli::try_parse_from(["pgn", "connect", "--insecure=false", "vpn.example.com"])
+            .expect("--insecure=false must parse");
         match cli.command {
             Some(Commands::Connect { insecure, .. }) => {
                 assert_eq!(insecure, Some(false));
@@ -1928,12 +2133,7 @@ mod tests {
         // `require_equals`-off refactor won't silently re-introduce
         // the positional-stealing bug the previous commit fixed.
         use clap::Parser;
-        let result = Cli::try_parse_from([
-            "pgn",
-            "connect",
-            "--insecure",
-            "true",
-        ]);
+        let result = Cli::try_parse_from(["pgn", "connect", "--insecure", "true"]);
         // It should still PARSE, but with `portal = Some("true")`
         // and `insecure = Some(true)` (bare-flag behaviour). The
         // important thing is clap does not try to consume "true"
@@ -1941,9 +2141,7 @@ mod tests {
         let cli = result.expect("bare --insecure + 'true' positional must parse");
         match cli.command {
             Some(Commands::Connect {
-                portal,
-                insecure,
-                ..
+                portal, insecure, ..
             }) => {
                 assert_eq!(portal.as_deref(), Some("true"));
                 assert_eq!(insecure, Some(true));
@@ -2004,13 +2202,8 @@ mod tests {
         // Same parser pin as --insecure: bare --reconnect must
         // not consume the next CLI token as its value.
         use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "pgn",
-            "connect",
-            "--reconnect",
-            "vpn.example.com",
-        ])
-        .expect("bare --reconnect followed by positional must parse");
+        let cli = Cli::try_parse_from(["pgn", "connect", "--reconnect", "vpn.example.com"])
+            .expect("bare --reconnect followed by positional must parse");
         match cli.command {
             Some(Commands::Connect {
                 portal, reconnect, ..
@@ -2019,6 +2212,111 @@ mod tests {
                 assert_eq!(reconnect, Some(true));
             }
             _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    // ---------- instance-name validation ----------
+
+    #[test]
+    fn instance_name_accepts_simple_labels() {
+        for name in ["default", "work", "client-a", "home_lab", "a", "A1_b-2"] {
+            validate_instance_name(name)
+                .unwrap_or_else(|e| panic!("expected {name:?} to be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn instance_name_rejects_empty_and_oversized() {
+        assert!(validate_instance_name("").is_err());
+        let too_long = "a".repeat(33);
+        assert!(validate_instance_name(&too_long).is_err());
+        // Exactly 32 is allowed.
+        validate_instance_name(&"a".repeat(32)).unwrap();
+    }
+
+    #[test]
+    fn instance_name_rejects_path_separators_and_shell_metachars() {
+        for bad in [
+            "has/slash",
+            "with space",
+            "..",
+            ".",
+            "foo.bar",
+            "with$dollar",
+            "with`tick",
+            "with\nnewline",
+            "with\ttab",
+            "unicode-café",
+            "semi;colon",
+        ] {
+            assert!(
+                validate_instance_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_instance_name_defaults_to_default() {
+        assert_eq!(resolve_instance_name(None).unwrap(), "default");
+        assert_eq!(resolve_instance_name(Some("work".into())).unwrap(), "work");
+    }
+
+    // ---------- clap parse for the new flags ----------
+
+    #[test]
+    fn connect_accepts_instance_flag() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["pgn", "connect", "--instance", "work", "vpn.example.com"])
+            .expect("--instance must parse");
+        match cli.command {
+            Some(Commands::Connect {
+                portal, instance, ..
+            }) => {
+                assert_eq!(portal.as_deref(), Some("vpn.example.com"));
+                assert_eq!(instance.as_deref(), Some("work"));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn disconnect_accepts_instance_and_all_but_not_together() {
+        use clap::Parser;
+        // Just --instance.
+        let cli = Cli::try_parse_from(["pgn", "disconnect", "-i", "work"]).unwrap();
+        matches!(cli.command, Some(Commands::Disconnect { .. }));
+
+        // Just --all.
+        let cli = Cli::try_parse_from(["pgn", "disconnect", "--all"]).unwrap();
+        matches!(cli.command, Some(Commands::Disconnect { all: true, .. }));
+
+        // Both together → clap should error (conflicts_with).
+        let result = Cli::try_parse_from(["pgn", "disconnect", "-i", "work", "--all"]);
+        assert!(
+            result.is_err(),
+            "--instance and --all must conflict (parsed OK unexpectedly)"
+        );
+    }
+
+    #[test]
+    fn status_accepts_instance_and_all() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["pgn", "status", "--instance", "work"]).unwrap();
+        match cli.command {
+            Some(Commands::Status { instance, all }) => {
+                assert_eq!(instance.as_deref(), Some("work"));
+                assert!(!all);
+            }
+            _ => panic!("expected Commands::Status"),
+        }
+        let cli = Cli::try_parse_from(["pgn", "status", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::Status { instance, all }) => {
+                assert!(instance.is_none());
+                assert!(all);
+            }
+            _ => panic!("expected Commands::Status"),
         }
     }
 

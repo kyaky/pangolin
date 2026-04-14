@@ -171,9 +171,16 @@ Options:
       --hip <MODE>              HIP reporting: auto (default) | force | off
       --reconnect[=BOOL]        Keep tunnel alive across short network blips
                                 (10-min libopenconnect reconnect budget)
+  -i, --instance <NAME>         Instance name (drives the control socket
+                                path and lets you run multiple tunnels
+                                in parallel). Default: "default".
 
-pgn status                     Show the running session (or "disconnected")
-pgn disconnect                 Tear down the running session
+pgn status [-i NAME] [--all]    Show running session(s). 0 live → disconnected.
+                                1 live → full details. 2+ live → list view,
+                                or pass -i/--all to pick.
+pgn disconnect [-i NAME] [--all]
+                                Tear down one or every running session.
+                                Refuses to guess when 2+ are live.
 
 pgn portal add <NAME> --url <URL> [FLAGS]   Save a portal profile
 pgn portal list                             List all saved profiles
@@ -187,38 +194,62 @@ the `pgn connect` flags. Once you've saved one and marked it as
 the default, `sudo pgn connect` (no arguments) will pick it up.
 CLI flags always override the profile's settings.
 
-`status` and `disconnect` talk to the running `pgn connect` process
-over a Unix control socket at `/run/pangolin/pangolin.sock` (mode
-`0600`, owner-only). Because the socket is created by the root-owned
-connect process, those subcommands also need `sudo`:
+### Multiple tunnels at once
+
+Each `pgn connect` is scoped by an **instance name** (defaults to
+`default`). Every instance gets its own control socket at
+`/run/pangolin/<instance>.sock`, its own TUN device, its own
+routes, and its own DNS state, so you can run several tunnels
+in parallel:
+
+```bash
+sudo pgn connect -i work       work
+sudo pgn connect -i client-a   client-a
+sudo pgn status --all          # list every live instance
+sudo pgn disconnect -i work    # tear down just one
+```
+
+No other open-source GlobalProtect client (openconnect, yuezk,
+the official Prisma Access Linux client) supports concurrent
+tunnels — for consultants / pentesters / migration scenarios,
+pangolin is the only option.
+
+`status` and `disconnect` talk to the running `pgn connect`
+process(es) over Unix control sockets in `/run/pangolin/` (mode
+`0600`, owner-only). Because the sockets are created by the
+root-owned connect processes, those subcommands also need `sudo`:
 
 ```bash
 sudo pgn status
 sudo pgn disconnect
 ```
 
-Both support `--json` for machine-readable output.
+Both support `--json` for machine-readable output. Instance names
+must match `[A-Za-z0-9_-]{1,32}`.
 
 ## Running as a systemd service
 
 `packaging/systemd/pangolin@.service` is a template unit — one
-instance per saved profile.
+instance per saved profile, and multiple units run in parallel
+without collision.
 
 ```bash
 sudo install -m 0644 packaging/systemd/pangolin@.service \
     /etc/systemd/system/pangolin@.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now pangolin@work.service
+sudo systemctl enable --now pangolin@client-a.service   # parallel, fully supported
 sudo journalctl -u pangolin@work.service -f
 ```
 
-The instance name (after the `@`) is whatever you'd type to
-`pgn connect` — a saved profile name OR a bare URL. The unit
+The instance name (after the `@`) is a saved profile name — it
+must match `[A-Za-z0-9_-]{1,32}`, so bare URLs are not supported
+as instance names. Save the URL as a profile first. The unit
 uses `Restart=on-failure` with a 15-second backoff, plumbs
-stdout/stderr to `journald`, and calls `pgn disconnect` on
-stop so the tunnel tears down through the same code path as
-`Ctrl-C`. See [packaging/systemd/README.md](packaging/systemd/README.md)
-for the full install + troubleshooting guide.
+stdout/stderr to `journald`, and relies on `SIGTERM → cmd pipe`
+for clean shutdown (no racy `ExecStop=pgn disconnect`). See
+[packaging/systemd/README.md](packaging/systemd/README.md) for
+the full install + troubleshooting guide.
 
 ---
 
@@ -288,6 +319,9 @@ production portal before they can be called production-ready.
   next step. (`SessionState::Reconnecting` is already wired
   into the IPC snapshot, ready to be flipped.)
 - ~~systemd unit~~ ✅ (template at `packaging/systemd/pangolin@.service`)
+- ~~Multi-instance parallel tunnels~~ ✅ (per-instance control
+  sockets in `gp-ipc`, `pgn connect --instance <name>`, `pgn
+  status --all`, `pgn disconnect --all`)
 - Prometheus metrics endpoint
 
 ### Phase 3 — differentiation
