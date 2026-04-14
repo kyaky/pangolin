@@ -168,7 +168,18 @@ Options:
 
 pgn status                     Show the running session (or "disconnected")
 pgn disconnect                 Tear down the running session
+
+pgn portal add <NAME> --url <URL> [FLAGS]   Save a portal profile
+pgn portal list                             List all saved profiles
+pgn portal use <NAME>                       Set the default profile
+pgn portal show <NAME>                      Show one profile's details
+pgn portal rm <NAME>                        Remove a profile
 ```
+
+Profiles live in `~/.config/pangolin/config.toml` and store any of
+the `pgn connect` flags. Once you've saved one and marked it as
+the default, `sudo pgn connect` (no arguments) will pick it up.
+CLI flags always override the profile's settings.
 
 `status` and `disconnect` talk to the running `pgn connect` process
 over a Unix control socket at `/run/pangolin/pangolin.sock` (mode
@@ -198,6 +209,7 @@ Both support `--json` for machine-readable output.
 | `gp-dns` | Native DNS management. Per-interface `resolvectl` on systemd-resolved hosts; graceful no-op + warning elsewhere |
 | `gp-ipc` | Unix control socket protocol (serde JSON) for `pgn status` / `pgn disconnect` |
 | `gp-hip` | HIP (Host Information Profile) report XML generator. Introspects hostname and machine id, ships a Windows-spoofed `HostProfile` with plausible antivirus/firewall/disk-encryption entries. HTTP submission via `gp-auth::GpClient::submit_hip_report` |
+| `gp-config` | `~/.config/pangolin/config.toml` schema and atomic load/save. Drives `pgn portal add/rm/list/use/show` |
 | `gp-config` | Still a stub — see the roadmap |
 | `bins/pgn` | The CLI, `tokio`-based |
 
@@ -232,6 +244,8 @@ policy. We never reimplement ESP/UDP, never shell out to the
 - ~~HIP report generation (`gp-hip`) — XML generator + HTTP
   submission via `gp-auth::GpClient`~~ ✅ (needs live verification
   against a HIP-enforcing portal)
+- ~~Multi-portal profiles (`gp-config` + `pgn portal` subcommand
+  tree, `~/.config/pangolin/config.toml`)~~ ✅
 - Multi-portal profiles (`pgn portal add`, `pgn portal use`)
 - Auto-reconnect with exponential backoff
 - systemd unit

@@ -57,9 +57,17 @@ enum HipMode {
 #[derive(Subcommand)]
 enum Commands {
     /// Connect to a GlobalProtect VPN portal.
+    ///
+    /// `portal` accepts either a profile name (defined via `pgn
+    /// portal add`) or a bare URL. Omitting it uses the default
+    /// profile set with `pgn portal use <name>`. CLI flags always
+    /// override the profile's settings; the profile fills in
+    /// whatever the CLI didn't specify.
     Connect {
-        /// Portal URL or config profile name.
-        portal: String,
+        /// Portal URL or saved profile name. Optional: uses
+        /// `default.portal` from `~/.config/pangolin/config.toml`
+        /// when omitted.
+        portal: Option<String>,
 
         /// Username.
         #[arg(short, long, env = "PGN_USER")]
@@ -69,9 +77,9 @@ enum Commands {
         #[arg(long)]
         passwd_on_stdin: bool,
 
-        /// OS to spoof (win, mac, linux).
-        #[arg(long, env = "PGN_OS", default_value = "win")]
-        os: String,
+        /// OS to spoof (win, mac, linux). Default `win`.
+        #[arg(long, env = "PGN_OS")]
+        os: Option<String>,
 
         /// Accept invalid TLS certificates.
         #[arg(long)]
@@ -85,20 +93,20 @@ enum Commands {
         /// SAML auth mode: `webview` (opens a local GTK+WebKit window,
         /// needs a display) or `paste` (headless — starts a local HTTP
         /// server, you complete auth in any browser and paste/POST the
-        /// callback URL back).
-        #[arg(long, value_enum, default_value_t = SamlAuthMode::Webview, env = "PGN_AUTH_MODE")]
-        auth_mode: SamlAuthMode,
+        /// callback URL back). Default `webview`.
+        #[arg(long, value_enum, env = "PGN_AUTH_MODE")]
+        auth_mode: Option<SamlAuthMode>,
 
-        /// Local port for paste-mode's callback server.
-        #[arg(long, default_value_t = 29999, env = "PGN_SAML_PORT")]
-        saml_port: u16,
+        /// Local port for paste-mode's callback server. Default 29999.
+        #[arg(long, env = "PGN_SAML_PORT")]
+        saml_port: Option<u16>,
 
         /// Only route these targets through the VPN (split tunnel).
         /// Accepts a comma-separated mix of CIDRs (`10.0.0.0/8`), bare IPs
         /// (`1.2.3.4`), and hostnames (`moodle.example.com` — resolved
         /// through your local DNS *before* the tunnel comes up). When set,
-        /// pgn uses its bundled vpnc-script which installs exactly these
-        /// routes and nothing else — default route and DNS stay untouched.
+        /// pgn installs exactly these routes natively and leaves the
+        /// default route alone.
         #[arg(long, value_name = "CIDR|IP|HOST", env = "PGN_ONLY")]
         only: Option<String>,
 
@@ -108,8 +116,8 @@ enum Commands {
         /// submits — useful for gateways that silently enforce
         /// HIP without announcing it. `off` skips the whole
         /// flow.
-        #[arg(long, value_enum, default_value_t = HipMode::Auto, env = "PGN_HIP")]
-        hip: HipMode,
+        #[arg(long, value_enum, env = "PGN_HIP")]
+        hip: Option<HipMode>,
     },
 
     /// Disconnect from VPN.
@@ -117,6 +125,62 @@ enum Commands {
 
     /// Show connection status.
     Status,
+
+    /// Manage saved portal profiles.
+    Portal {
+        #[command(subcommand)]
+        action: PortalAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PortalAction {
+    /// Add or overwrite a saved portal profile.
+    Add {
+        /// Short name for the profile (used with `pgn connect <name>`).
+        name: String,
+        /// Portal URL (hostname or full https://…).
+        #[arg(long)]
+        url: String,
+        /// Default username for this profile.
+        #[arg(long)]
+        user: Option<String>,
+        /// OS to spoof.
+        #[arg(long)]
+        os: Option<String>,
+        /// SAML auth mode.
+        #[arg(long, value_enum)]
+        auth_mode: Option<SamlAuthMode>,
+        /// Split-tunnel target list.
+        #[arg(long, value_name = "CIDR|IP|HOST")]
+        only: Option<String>,
+        /// HIP reporting mode.
+        #[arg(long, value_enum)]
+        hip: Option<HipMode>,
+        /// vpnc-compatible script path.
+        #[arg(long)]
+        vpnc_script: Option<String>,
+        /// Accept invalid TLS certificates.
+        #[arg(long)]
+        insecure: bool,
+    },
+    /// Remove a saved portal profile.
+    Rm {
+        /// Profile name to remove.
+        name: String,
+    },
+    /// List all saved portal profiles.
+    List,
+    /// Set the default profile used by `pgn connect` with no args.
+    Use {
+        /// Profile name to mark as default.
+        name: String,
+    },
+    /// Show one profile's full details.
+    Show {
+        /// Profile name to display.
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -159,7 +223,117 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Disconnect) => disconnect(cli.json).await,
         Some(Commands::Status) | None => status(cli.json).await,
+        Some(Commands::Portal { action }) => portal_command(action).await,
     }
+}
+
+/// Dispatch for `pgn portal <action>`. All actions mutate (or
+/// read) `~/.config/pangolin/config.toml` via the `gp-config`
+/// crate's atomic save.
+async fn portal_command(action: PortalAction) -> Result<()> {
+    let path = gp_config::PangolinConfig::default_path();
+    let mut config = gp_config::PangolinConfig::load_from(&path)
+        .with_context(|| format!("loading {}", path.display()))?;
+
+    match action {
+        PortalAction::Add {
+            name,
+            url,
+            user,
+            os,
+            auth_mode,
+            only,
+            hip,
+            vpnc_script,
+            insecure,
+        } => {
+            let profile = gp_config::PortalProfile {
+                url,
+                username: user,
+                gateway: None,
+                os,
+                auth_mode: auth_mode.map(|m| match m {
+                    SamlAuthMode::Webview => "webview".to_string(),
+                    SamlAuthMode::Paste => "paste".to_string(),
+                }),
+                saml_port: None,
+                vpnc_script,
+                only,
+                hip: hip.map(|m| match m {
+                    HipMode::Auto => "auto".to_string(),
+                    HipMode::Force => "force".to_string(),
+                    HipMode::Off => "off".to_string(),
+                }),
+                insecure: if insecure { Some(true) } else { None },
+            };
+            config.set_portal(name.clone(), profile);
+            config.save_to(&path)?;
+            println!("saved profile `{}` to {}", name, path.display());
+        }
+        PortalAction::Rm { name } => {
+            if !config.remove_portal(&name) {
+                anyhow::bail!("no such profile: {name}");
+            }
+            config.save_to(&path)?;
+            println!("removed profile `{}`", name);
+        }
+        PortalAction::List => {
+            if config.portal.is_empty() {
+                println!("(no saved profiles — use `pgn portal add <name> --url …` to create one)");
+                return Ok(());
+            }
+            let default_name = config.default.portal.as_deref();
+            for (name, profile) in &config.portal {
+                let marker = if Some(name.as_str()) == default_name {
+                    " (default)"
+                } else {
+                    ""
+                };
+                println!("{name}{marker}: {}", profile.url);
+            }
+        }
+        PortalAction::Use { name } => {
+            if !config.portal.contains_key(&name) {
+                anyhow::bail!("no such profile: {name}");
+            }
+            config.default.portal = Some(name.clone());
+            config.save_to(&path)?;
+            println!("default profile set to `{}`", name);
+        }
+        PortalAction::Show { name } => {
+            let profile = config
+                .portal
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("no such profile: {name}"))?;
+            println!("profile:    {name}");
+            println!("url:        {}", profile.url);
+            if let Some(u) = &profile.username {
+                println!("user:       {u}");
+            }
+            if let Some(o) = &profile.os {
+                println!("os:         {o}");
+            }
+            if let Some(a) = &profile.auth_mode {
+                println!("auth-mode:  {a}");
+            }
+            if let Some(p) = profile.saml_port {
+                println!("saml-port:  {p}");
+            }
+            if let Some(o) = &profile.only {
+                println!("only:       {o}");
+            }
+            if let Some(h) = &profile.hip {
+                println!("hip:        {h}");
+            }
+            if let Some(s) = &profile.vpnc_script {
+                println!("vpnc-script:{s}");
+            }
+            if profile.insecure == Some(true) {
+                println!("insecure:   true");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Where the running session keeps its control socket. Currently a
@@ -270,16 +444,16 @@ async fn disconnect(json: bool) -> Result<()> {
 }
 
 struct ConnectArgs {
-    portal: String,
+    portal: Option<String>,
     user: Option<String>,
     passwd_on_stdin: bool,
-    os: String,
+    os: Option<String>,
     insecure: bool,
     vpnc_script: Option<String>,
-    auth_mode: SamlAuthMode,
-    saml_port: u16,
+    auth_mode: Option<SamlAuthMode>,
+    saml_port: Option<u16>,
     only: Option<String>,
-    hip: HipMode,
+    hip: Option<HipMode>,
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -295,20 +469,64 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         only,
         hip,
     } = args;
-    let portal = portal.as_str();
-    let os = os.as_str();
-    // 1. Load config
+
+    // 1. Load config + resolve the portal argument to a profile.
+    //
+    // Resolution order for every flag is: explicit CLI > profile
+    // field > hard-coded default. The CLI layer already handled
+    // "explicit CLI > env var" for us by treating missing flags
+    // as `None`.
     let config = gp_config::PangolinConfig::load().context("loading config")?;
 
-    let (portal_url, cfg_user) = if let Some(profile) = config.find_portal(portal) {
-        (profile.url.clone(), profile.username.clone())
-    } else {
-        (portal.to_string(), None)
+    let portal_arg: Option<String> = match portal {
+        Some(p) => Some(p),
+        None => config.default.portal.clone(),
+    };
+    let portal_arg = portal_arg.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no portal given and no default profile set — pass a portal URL or \
+             run `pgn portal use <name>` first"
+        )
+    })?;
+
+    let profile = config.find_portal(&portal_arg).cloned();
+    let (portal_url, cfg_user) = match &profile {
+        Some(p) => (p.url.clone(), p.username.clone()),
+        None => (portal_arg.clone(), None),
     };
 
     // Normalize: strip scheme and trailing slash so we never build
     // "https://https://..." URLs.
     let portal_url = gp_proto::params::normalize_server(&portal_url).to_string();
+
+    // --- Merge CLI flags with profile + hard-coded defaults ---
+    let os: String = os
+        .or_else(|| profile.as_ref().and_then(|p| p.os.clone()))
+        .unwrap_or_else(|| config.default.os.clone());
+    let os = os.as_str();
+    let auth_mode: SamlAuthMode = auth_mode
+        .or_else(|| {
+            profile
+                .as_ref()
+                .and_then(|p| p.auth_mode.as_deref())
+                .and_then(parse_auth_mode)
+        })
+        .unwrap_or(SamlAuthMode::Webview);
+    let saml_port: u16 = saml_port
+        .or_else(|| profile.as_ref().and_then(|p| p.saml_port))
+        .unwrap_or(29999);
+    let vpnc_script: Option<String> =
+        vpnc_script.or_else(|| profile.as_ref().and_then(|p| p.vpnc_script.clone()));
+    let only: Option<String> = only.or_else(|| profile.as_ref().and_then(|p| p.only.clone()));
+    let hip: HipMode = hip
+        .or_else(|| {
+            profile
+                .as_ref()
+                .and_then(|p| p.hip.as_deref())
+                .and_then(parse_hip_mode)
+        })
+        .unwrap_or(HipMode::Auto);
+    let insecure = insecure || profile.as_ref().and_then(|p| p.insecure).unwrap_or(false);
 
     let client_os: ClientOs = os.parse().unwrap_or_default();
     let mut gp_params = GpParams::new(client_os);
@@ -688,6 +906,29 @@ async fn connect(args: ConnectArgs) -> Result<()> {
     };
     let _ = tunnel_thread.join();
     final_res
+}
+
+/// Parse a string-form auth mode (from a TOML profile's
+/// `auth_mode` field) into the CLI enum. Returns `None` for
+/// unknown values so the caller can fall through to a safe
+/// default rather than error.
+fn parse_auth_mode(s: &str) -> Option<SamlAuthMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "webview" => Some(SamlAuthMode::Webview),
+        "paste" => Some(SamlAuthMode::Paste),
+        _ => None,
+    }
+}
+
+/// Parse a string-form HIP mode (from a TOML profile's `hip`
+/// field) into the CLI enum. Returns `None` for unknown values.
+fn parse_hip_mode(s: &str) -> Option<HipMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Some(HipMode::Auto),
+        "force" => Some(HipMode::Force),
+        "off" | "no" | "false" => Some(HipMode::Off),
+        _ => None,
+    }
 }
 
 /// Run the HIP check + (optional) report submission flow. Returns
