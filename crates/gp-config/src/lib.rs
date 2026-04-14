@@ -149,6 +149,12 @@ pub struct PortalProfile {
     /// Accept invalid TLS certificates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insecure: Option<bool>,
+
+    /// Keep the tunnel alive across brief network blips by
+    /// passing a larger `reconnect_timeout` to libopenconnect.
+    /// See `pgn connect --reconnect` for the full semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect: Option<bool>,
 }
 
 fn default_os() -> String {

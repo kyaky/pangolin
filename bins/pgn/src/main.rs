@@ -139,6 +139,33 @@ enum Commands {
         /// flow.
         #[arg(long, value_enum, env = "PGN_HIP")]
         hip: Option<HipMode>,
+
+        /// Keep the tunnel alive across network blips.
+        ///
+        /// When enabled, pangolin tells libopenconnect to spend
+        /// up to 10 minutes trying to reconnect after a drop
+        /// before giving up (vs the 60-second default). This
+        /// handles the common case of a brief network outage
+        /// without needing any new user-facing state machine.
+        ///
+        /// Tri-state, mirroring `--insecure`: bare `--reconnect`
+        /// means true, `--reconnect=false` means false, omitted
+        /// falls through to the profile, and profile fields fall
+        /// through to the hard-coded default (false — the user
+        /// must opt in).
+        ///
+        /// NOTE: this does NOT yet cover tunnel teardown AFTER
+        /// libopenconnect's own reconnect budget is exhausted.
+        /// Full application-level re-auth + retry is queued as
+        /// a separate Phase 2b commit.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true,
+            env = "PGN_RECONNECT"
+        )]
+        reconnect: Option<bool>,
     },
 
     /// Disconnect from VPN.
@@ -184,6 +211,11 @@ enum PortalAction {
         /// Accept invalid TLS certificates.
         #[arg(long)]
         insecure: bool,
+        /// Tell pgn to keep the tunnel alive across brief
+        /// network blips (libopenconnect 10-minute reconnect
+        /// budget instead of the 60-second default).
+        #[arg(long)]
+        reconnect: bool,
     },
     /// Remove a saved portal profile.
     Rm {
@@ -227,6 +259,7 @@ async fn main() -> Result<()> {
             saml_port,
             only,
             hip,
+            reconnect,
         }) => {
             connect(ConnectArgs {
                 portal,
@@ -239,6 +272,7 @@ async fn main() -> Result<()> {
                 saml_port,
                 only,
                 hip,
+                reconnect,
             })
             .await
         }
@@ -267,6 +301,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             hip,
             vpnc_script,
             insecure,
+            reconnect,
         } => {
             let profile = gp_config::PortalProfile {
                 url,
@@ -286,6 +321,7 @@ async fn portal_command(action: PortalAction) -> Result<()> {
                     HipMode::Off => "off".to_string(),
                 }),
                 insecure: if insecure { Some(true) } else { None },
+                reconnect: if reconnect { Some(true) } else { None },
             };
             config.set_portal(name.clone(), profile);
             config.save_to(&path)?;
@@ -351,6 +387,9 @@ async fn portal_command(action: PortalAction) -> Result<()> {
             }
             if profile.insecure == Some(true) {
                 println!("insecure:   true");
+            }
+            if profile.reconnect == Some(true) {
+                println!("reconnect:  true");
             }
         }
     }
@@ -475,6 +514,7 @@ struct ConnectArgs {
     saml_port: Option<u16>,
     only: Option<String>,
     hip: Option<HipMode>,
+    reconnect: Option<bool>,
 }
 
 async fn connect(args: ConnectArgs) -> Result<()> {
@@ -489,6 +529,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         saml_port,
         only,
         hip,
+        reconnect,
     } = args;
 
     // 1. Load config + resolve CLI args against the profile layer.
@@ -504,6 +545,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
             saml_port,
             only,
             hip,
+            reconnect,
         },
         &config,
     )?;
@@ -517,6 +559,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         only,
         hip,
         insecure,
+        reconnect,
         user: merged_user,
     } = resolved;
 
@@ -773,6 +816,7 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 oc_os,
                 script.as_deref(),
                 split_routes,
+                reconnect,
                 cancel_tx,
                 ready_tx,
             );
@@ -963,6 +1007,7 @@ struct CliConnectOverrides {
     saml_port: Option<u16>,
     only: Option<String>,
     hip: Option<HipMode>,
+    reconnect: Option<bool>,
 }
 
 /// Fully-resolved connection settings: every field is either the
@@ -981,6 +1026,7 @@ struct ResolvedConnectSettings {
     only: Option<String>,
     hip: HipMode,
     insecure: bool,
+    reconnect: bool,
 }
 
 /// Pure function: merge `cli` on top of `config` to produce the
@@ -1057,6 +1103,12 @@ fn resolve_connect_settings(
         .insecure
         .or_else(|| profile.as_ref().and_then(|p| p.insecure))
         .unwrap_or(false);
+    // Same tri-state pattern for reconnect. Default off — the
+    // user must opt in.
+    let reconnect: bool = cli
+        .reconnect
+        .or_else(|| profile.as_ref().and_then(|p| p.reconnect))
+        .unwrap_or(false);
     // `cli.user` wins; profile.username is the fallback.
     let user: Option<String> = cli
         .user
@@ -1073,6 +1125,7 @@ fn resolve_connect_settings(
         only,
         hip,
         insecure,
+        reconnect,
     })
 }
 
@@ -1431,6 +1484,7 @@ fn run_tunnel(
     os: &str,
     vpnc_script: Option<&str>,
     split_routes: Vec<String>,
+    reconnect_enabled: bool,
     cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
     ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
@@ -1586,7 +1640,18 @@ fn run_tunnel(
     });
 
     // The blocking main loop. Returns when cancelled or the remote drops.
-    let run_res = session.run(60, 10);
+    // `reconnect_timeout` is the number of seconds libopenconnect
+    // will keep trying to re-establish the tunnel after it drops
+    // before giving up and returning from mainloop. 60s is the
+    // pre-`--reconnect` default; 600s (10 min) is the opted-in
+    // value, enough to ride through a laptop suspend or a short
+    // ISP blip. A true application-level reauth-and-retry state
+    // machine is still pending as Phase 2b follow-up work.
+    let reconnect_timeout = if reconnect_enabled { 600 } else { 60 };
+    tracing::info!(
+        "openconnect mainloop: reconnect_timeout={reconnect_timeout}s, reconnect_interval=10s"
+    );
+    let run_res = session.run(reconnect_timeout, 10);
 
     // Best-effort cleanup. DNS first (short-lived resolved state),
     // then routes (we want the interface to have no dangling route
@@ -1672,6 +1737,7 @@ mod tests {
             saml_port: None,
             only: None,
             hip: None,
+            reconnect: None,
         }
     }
 
@@ -1690,6 +1756,7 @@ mod tests {
                 only: Some("10.0.0.0/8".into()),
                 hip: Some("force".into()),
                 insecure: Some(true),
+                reconnect: Some(true),
                 ..gp_config::PortalProfile::default()
             },
         );
@@ -1886,6 +1953,76 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reconnect_defaults_to_off() {
+        let cfg = gp_config::PangolinConfig::default();
+        let overrides = CliConnectOverrides {
+            portal: Some("vpn.example.com".into()),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert!(!r.reconnect, "default should be off (opt-in)");
+    }
+
+    #[test]
+    fn resolve_reconnect_inherits_from_profile() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                reconnect: Some(true),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
+        assert!(r.reconnect);
+    }
+
+    #[test]
+    fn resolve_reconnect_cli_false_overrides_profile_true() {
+        let mut cfg = gp_config::PangolinConfig::default();
+        cfg.default.portal = Some("work".into());
+        cfg.set_portal(
+            "work",
+            gp_config::PortalProfile {
+                url: "vpn.example.com".into(),
+                reconnect: Some(true),
+                ..gp_config::PortalProfile::default()
+            },
+        );
+        let overrides = CliConnectOverrides {
+            reconnect: Some(false),
+            ..empty_overrides()
+        };
+        let r = resolve_connect_settings(overrides, &cfg).unwrap();
+        assert!(!r.reconnect, "--reconnect=false should override profile");
+    }
+
+    #[test]
+    fn reconnect_bare_flag_does_not_steal_next_positional() {
+        // Same parser pin as --insecure: bare --reconnect must
+        // not consume the next CLI token as its value.
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--reconnect",
+            "vpn.example.com",
+        ])
+        .expect("bare --reconnect followed by positional must parse");
+        match cli.command {
+            Some(Commands::Connect {
+                portal, reconnect, ..
+            }) => {
+                assert_eq!(portal.as_deref(), Some("vpn.example.com"));
+                assert_eq!(reconnect, Some(true));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
     fn resolve_hardcoded_defaults_when_no_profile_and_no_cli() {
         // Portal passed as a raw URL, nothing else specified —
         // every field should land on its hardcoded default.
@@ -1900,6 +2037,7 @@ mod tests {
         assert_eq!(r.saml_port, 29999);
         assert_eq!(r.hip, HipMode::Auto);
         assert!(!r.insecure);
+        assert!(!r.reconnect);
         assert!(r.only.is_none());
         assert!(r.vpnc_script.is_none());
     }

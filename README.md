@@ -169,6 +169,8 @@ Options:
       --saml-port <PORT>        Local port for paste-mode HTTP server (29999)
       --only <CIDR|IP|HOST>     Comma-separated split-tunnel targets
       --hip <MODE>              HIP reporting: auto (default) | force | off
+      --reconnect[=BOOL]        Keep tunnel alive across short network blips
+                                (10-min libopenconnect reconnect budget)
 
 pgn status                     Show the running session (or "disconnected")
 pgn disconnect                 Tear down the running session
@@ -257,9 +259,13 @@ production portal before they can be called production-ready.
 
 ### Phase 2b — next
 
-- Auto-reconnect with exponential backoff
-  (`SessionState::Reconnecting` is already wired into the IPC
-  snapshot, just needs the state machine)
+- Application-level auto-reconnect state machine. The current
+  `--reconnect` flag bumps libopenconnect's internal reconnect
+  budget from 60 seconds to 10 minutes, which covers brief
+  blips. A full retry-after-libopenconnect-gives-up loop with
+  exponential backoff and re-auth on cookie expiry is the
+  next step. (`SessionState::Reconnecting` is already wired
+  into the IPC snapshot, ready to be flipped.)
 - systemd unit
 - Prometheus metrics endpoint
 
