@@ -237,19 +237,29 @@ policy. We never reimplement ESP/UDP, never shell out to the
 - `--only` client-controlled split tunnel, hostname + CIDR aware
 - Clean Ctrl-C cancellation via `openconnect_setup_cmd_pipe`
 
-### Phase 2 — next
+### Phase 2 — implemented
 
-- ~~`pgn status` / `pgn disconnect` via unix socket~~ ✅
-- ~~Native route management (`gp-route`) — `ip(8)` for now, rtnetlink
-  later~~ ✅
-- ~~Native DNS management (`gp-dns`) — systemd-resolved backend;
-  resolvconf / direct-resolv.conf later~~ ✅
-- ~~HIP report generation (`gp-hip`) — XML generator + HTTP
-  submission via `gp-auth::GpClient`~~ ✅ (needs live verification
-  against a HIP-enforcing portal)
-- ~~Multi-portal profiles (`gp-config` + `pgn portal` subcommand
-  tree, `~/.config/pangolin/config.toml`)~~ ✅
+Everything below is landed, unit-tested, and clippy-clean. Items
+marked with the footnote still need live verification against a
+production portal before they can be called production-ready.
+
+- `pgn status` / `pgn disconnect` via unix control socket
+- Native route management (`gp-route`) — `ip(8)` for now,
+  rtnetlink later
+- Native DNS management (`gp-dns`) — systemd-resolved backend;
+  resolvconf / direct-resolv.conf later
+- HIP report generation (`gp-hip`) — XML generator + HTTP
+  submission via `gp-auth::GpClient`  ¹
+- Multi-portal profiles (`gp-config` + `pgn portal add/use/list/
+  show/rm`, `~/.config/pangolin/config.toml`)
+
+¹ Not yet exercised against a gateway that actually enforces HIP.
+
+### Phase 2b — next
+
 - Auto-reconnect with exponential backoff
+  (`SessionState::Reconnecting` is already wired into the IPC
+  snapshot, just needs the state machine)
 - systemd unit
 - Prometheus metrics endpoint
 

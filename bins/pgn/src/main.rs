@@ -90,7 +90,20 @@ enum Commands {
         ///   * `--insecure=true`    → true
         ///   * `--insecure=false`   → false (overrides profile)
         ///   * (omitted)            → None, fall through to profile
-        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        ///
+        /// `require_equals = true` is load-bearing here: without
+        /// it, `num_args = 0..=1` would eagerly consume the next
+        /// token, and `pgn connect --insecure vpn.example.com`
+        /// would try to parse the portal arg as a bool. Forcing
+        /// the `=` syntax for explicit values keeps the bare
+        /// `--insecure` form working (via `default_missing_value`)
+        /// without stealing positional args.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            require_equals = true
+        )]
         insecure: Option<bool>,
 
         /// Path to a vpnc-compatible script for route/DNS setup.
@@ -1787,6 +1800,86 @@ mod tests {
         );
         let r = resolve_connect_settings(empty_overrides(), &cfg).unwrap();
         assert_eq!(r.auth_mode, SamlAuthMode::Webview); // the hardcoded default
+    }
+
+    #[test]
+    fn insecure_bare_flag_does_not_steal_next_positional() {
+        // Regression guard for the clap parse-ambiguity caught in
+        // review round 12. Before `require_equals = true`, the
+        // `--insecure` arg's `num_args = 0..=1` would eagerly
+        // consume the next token, so `pgn connect --insecure
+        // vpn.example.com` parsed `vpn.example.com` as the
+        // --insecure value and blew up with a bool parse error.
+        // Now that `require_equals` is set, only `--insecure=…`
+        // syntax can supply a value.
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--insecure",
+            "vpn.example.com",
+        ])
+        .expect("bare --insecure followed by positional must parse");
+        match cli.command {
+            Some(Commands::Connect {
+                portal,
+                insecure,
+                ..
+            }) => {
+                assert_eq!(portal.as_deref(), Some("vpn.example.com"));
+                // Bare --insecure → default_missing_value → Some(true)
+                assert_eq!(insecure, Some(true));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn insecure_equals_false_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--insecure=false",
+            "vpn.example.com",
+        ])
+        .expect("--insecure=false must parse");
+        match cli.command {
+            Some(Commands::Connect { insecure, .. }) => {
+                assert_eq!(insecure, Some(false));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
+    }
+
+    #[test]
+    fn insecure_space_separated_value_is_rejected() {
+        // `--insecure true` (space, not `=`) must be rejected with
+        // `require_equals`, otherwise we'd have the same positional-
+        // stealing bug in a slightly different guise.
+        use clap::Parser;
+        let result = Cli::try_parse_from([
+            "pgn",
+            "connect",
+            "--insecure",
+            "true",
+        ]);
+        // It should still PARSE, but with `portal = Some("true")`
+        // and `insecure = Some(true)` (bare-flag behaviour). The
+        // important thing is clap does not try to consume "true"
+        // as the value for --insecure.
+        let cli = result.expect("bare --insecure + 'true' positional must parse");
+        match cli.command {
+            Some(Commands::Connect {
+                portal,
+                insecure,
+                ..
+            }) => {
+                assert_eq!(portal.as_deref(), Some("true"));
+                assert_eq!(insecure, Some(true));
+            }
+            _ => panic!("expected Commands::Connect"),
+        }
     }
 
     #[test]
