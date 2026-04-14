@@ -277,12 +277,21 @@ pub fn revert(state: &AppliedDnsState) -> Vec<String> {
 }
 
 /// Like [`revert`] but uses the given [`CommandRunner`].
+///
+/// **Scope caveat:** `resolvectl revert <iface>` is broader than a
+/// strict inverse of what [`apply`] pushed. It clears *all*
+/// per-interface DNS state that resolved is holding — not just the
+/// `dns` and `domain` settings we set. On a freshly created
+/// libopenconnect tun interface nothing else could have attached
+/// per-link state to that link yet, so in practice the broader
+/// revert is correct. If a future caller ever reuses a long-lived
+/// interface with prior resolved state, switch to targeted
+/// `resolvectl dns <iface>` / `resolvectl domain <iface>` calls
+/// with empty arguments instead.
 pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec<String> {
     let mut errors = Vec::new();
     match state.backend {
         Backend::SystemdResolved => {
-            // `resolvectl revert <iface>` drops all configuration
-            // we pushed via `resolvectl dns` and `resolvectl domain`.
             if let Err(e) =
                 run_resolvectl(runner, "revert", &["revert", &state.ifname])
             {

@@ -968,7 +968,28 @@ fn run_tunnel(
                 config.ifname,
                 config.search_domains
             );
-            Some(gp_dns::apply(&config).context("gp-dns apply")?)
+            match gp_dns::apply(&config) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    // gp-dns failed AFTER gp-route::apply already
+                    // installed routes. The bottom cleanup block
+                    // will not run from a `?` bailout here, so we
+                    // must revert the route state explicitly before
+                    // propagating the error — otherwise the installed
+                    // `ip route add`s leak until the kernel GCs the
+                    // tun interface.
+                    if let Some(route_state) = native_route_state.as_ref() {
+                        tracing::warn!(
+                            "gp-dns apply failed, rolling back gp-route state on {}",
+                            route_state.ifname
+                        );
+                        for rev_err in gp_route::revert(route_state) {
+                            tracing::warn!("gp-route revert (on dns failure): {rev_err}");
+                        }
+                    }
+                    return Err(anyhow::anyhow!(e).context("gp-dns apply"));
+                }
+            }
         } else {
             None
         }
