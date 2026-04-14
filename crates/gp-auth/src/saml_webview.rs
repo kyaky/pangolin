@@ -104,53 +104,48 @@ fn run_saml_webview(saml: &SamlPrelogin) -> Result<SamlCapture, AuthError> {
     {
         let captured = Rc::clone(&captured);
         let window_clone = window.clone();
-        webview.connect_decide_policy(move |_wv, decision, decision_type| {
-            match decision_type {
-                PolicyDecisionType::NavigationAction | PolicyDecisionType::NewWindowAction => {
-                    let Ok(nav) = decision
-                        .clone()
-                        .downcast::<webkit2gtk::NavigationPolicyDecision>()
-                    else {
-                        return false;
-                    };
-                    let Some(action) = nav.navigation_action() else {
-                        return false;
-                    };
-                    let Some(req) = action.request() else {
-                        return false;
-                    };
-                    let uri = req.uri().unwrap_or_default();
-                    if let Some(cap) = parse_globalprotect_callback(&uri) {
-                        tracing::info!(
-                            "captured globalprotectcallback for {}",
-                            cap.username
-                        );
-                        *captured.borrow_mut() = Some(cap);
-                        window_clone.close();
-                        return true;
-                    }
-                    false
+        webview.connect_decide_policy(move |_wv, decision, decision_type| match decision_type {
+            PolicyDecisionType::NavigationAction | PolicyDecisionType::NewWindowAction => {
+                let Ok(nav) = decision
+                    .clone()
+                    .downcast::<webkit2gtk::NavigationPolicyDecision>()
+                else {
+                    return false;
+                };
+                let Some(action) = nav.navigation_action() else {
+                    return false;
+                };
+                let Some(req) = action.request() else {
+                    return false;
+                };
+                let uri = req.uri().unwrap_or_default();
+                if let Some(cap) = parse_globalprotect_callback(&uri) {
+                    tracing::info!("captured globalprotectcallback for {}", cap.username);
+                    *captured.borrow_mut() = Some(cap);
+                    window_clone.close();
+                    return true;
                 }
-                PolicyDecisionType::Response => {
-                    let Ok(response_decision) = decision
-                        .clone()
-                        .downcast::<webkit2gtk::ResponsePolicyDecision>()
-                    else {
-                        return false;
-                    };
-                    let Some(response) = response_decision.response() else {
-                        return false;
-                    };
-                    if let Some(cap) = extract_from_response(&response) {
-                        tracing::info!("SAML auth completed for {}", cap.username);
-                        *captured.borrow_mut() = Some(cap);
-                        window_clone.close();
-                        return true;
-                    }
-                    false
-                }
-                _ => false,
+                false
             }
+            PolicyDecisionType::Response => {
+                let Ok(response_decision) = decision
+                    .clone()
+                    .downcast::<webkit2gtk::ResponsePolicyDecision>()
+                else {
+                    return false;
+                };
+                let Some(response) = response_decision.response() else {
+                    return false;
+                };
+                if let Some(cap) = extract_from_response(&response) {
+                    tracing::info!("SAML auth completed for {}", cap.username);
+                    *captured.borrow_mut() = Some(cap);
+                    window_clone.close();
+                    return true;
+                }
+                false
+            }
+            _ => false,
         });
     }
 

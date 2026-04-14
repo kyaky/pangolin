@@ -86,10 +86,7 @@ pub struct AppliedDnsState {
 #[derive(Debug, Error)]
 pub enum DnsError {
     #[error("resolvectl failed: {op}: {stderr}")]
-    Resolvectl {
-        op: &'static str,
-        stderr: String,
-    },
+    Resolvectl { op: &'static str, stderr: String },
 
     #[error("spawning subprocess: {0}")]
     Spawn(#[from] io::Error),
@@ -116,11 +113,7 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-fn run_with_timeout(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> io::Result<Output> {
+fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
     let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
@@ -292,9 +285,7 @@ pub fn revert_with<R: CommandRunner>(runner: &R, state: &AppliedDnsState) -> Vec
     let mut errors = Vec::new();
     match state.backend {
         Backend::SystemdResolved => {
-            if let Err(e) =
-                run_resolvectl(runner, "revert", &["revert", &state.ifname])
-            {
+            if let Err(e) = run_resolvectl(runner, "revert", &["revert", &state.ifname]) {
                 errors.push(format!("resolvectl revert {}: {e}", state.ifname));
             }
         }
@@ -409,9 +400,9 @@ mod tests {
     #[test]
     fn apply_issues_dns_and_domain_commands() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok_active()),          // detect
-            Ok(FakeRunner::ok_with_stdout("")),   // resolvectl dns
-            Ok(FakeRunner::ok_with_stdout("")),   // resolvectl domain
+            Ok(FakeRunner::ok_active()),        // detect
+            Ok(FakeRunner::ok_with_stdout("")), // resolvectl dns
+            Ok(FakeRunner::ok_with_stdout("")), // resolvectl domain
         ]);
         let state = apply_with(
             &runner,
@@ -427,10 +418,7 @@ mod tests {
 
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 3);
-        assert_eq!(
-            calls[0],
-            vec!["systemctl", "is-active", "systemd-resolved"]
-        );
+        assert_eq!(calls[0], vec!["systemctl", "is-active", "systemd-resolved"]);
         assert_eq!(
             calls[1],
             vec!["resolvectl", "dns", "tun0", "10.0.0.53", "10.0.0.54"]
@@ -458,10 +446,7 @@ mod tests {
         assert_eq!(state.backend, Backend::SystemdResolved);
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 2); // detect + dns; no domain
-        assert_eq!(
-            calls[1],
-            vec!["resolvectl", "dns", "tun0", "10.0.0.53"]
-        );
+        assert_eq!(calls[1], vec!["resolvectl", "dns", "tun0", "10.0.0.53"]);
     }
 
     #[test]
@@ -477,8 +462,11 @@ mod tests {
     #[test]
     fn apply_without_resolved_falls_back_to_none() {
         let runner = FakeRunner::new(vec![Ok(FakeRunner::ok_inactive())]);
-        let state =
-            apply_with(&runner, &cfg(vec!["10.0.0.53"], vec![], vec!["intranet.example.com"])).unwrap();
+        let state = apply_with(
+            &runner,
+            &cfg(vec!["10.0.0.53"], vec![], vec!["intranet.example.com"]),
+        )
+        .unwrap();
         assert_eq!(state.backend, Backend::None);
         // Only the detection call ran.
         assert_eq!(runner.calls.borrow().len(), 1);
@@ -487,10 +475,10 @@ mod tests {
     #[test]
     fn apply_rolls_back_on_domain_failure() {
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok_active()),            // detect
-            Ok(FakeRunner::ok_with_stdout("")),     // dns (ok)
-            Ok(FakeRunner::err("nope")),            // domain (fails)
-            Ok(FakeRunner::ok_with_stdout("")),     // revert (ok)
+            Ok(FakeRunner::ok_active()),        // detect
+            Ok(FakeRunner::ok_with_stdout("")), // dns (ok)
+            Ok(FakeRunner::err("nope")),        // domain (fails)
+            Ok(FakeRunner::ok_with_stdout("")), // revert (ok)
         ]);
         let err = apply_with(
             &runner,

@@ -205,7 +205,10 @@ fn print_instructions(addr: &SocketAddr, saml: &SamlPrelogin) {
     eprintln!("│                                                                            │");
     eprintln!("│  Open this URL in any browser (any machine):                               │");
     eprintln!("│                                                                            │");
-    eprintln!("│    http://{}/                                              ", addr);
+    eprintln!(
+        "│    http://{}/                                              ",
+        addr
+    );
     eprintln!("│                                                                            │");
     eprintln!("│  Over SSH? Port-forward first:                                             │");
     eprintln!(
@@ -281,7 +284,10 @@ fn http_server_loop(
         match handle_one_request(&mut stream, &launch_body) {
             Ok(Some(uri)) => {
                 if let Some(cap) = parse_globalprotect_callback(&uri) {
-                    let _ = respond_ok(&mut stream, b"pangolin: authentication captured, you can close this tab\n");
+                    let _ = respond_ok(
+                        &mut stream,
+                        b"pangolin: authentication captured, you can close this tab\n",
+                    );
                     let _ = tx.send(cap);
                     break;
                 } else {
@@ -352,13 +358,7 @@ fn handle_one_request(
 
     match (method, path) {
         ("GET", "/") | ("GET", "") => {
-            respond(
-                stream,
-                200,
-                "OK",
-                "text/html; charset=utf-8",
-                launch_body,
-            )?;
+            respond(stream, 200, "OK", "text/html; charset=utf-8", launch_body)?;
             Ok(None)
         }
         ("GET", p) if p.starts_with("/callback") => {
@@ -529,10 +529,7 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
 
     // Helper: consume `n` bytes from `buf` and update `current_line`.
     // Returns Captured if a callback was matched.
-    let feed = |buf: &[u8],
-                current_line: &mut Vec<u8>,
-                discarding_overlong: &mut bool|
-     -> Feed {
+    let feed = |buf: &[u8], current_line: &mut Vec<u8>, discarding_overlong: &mut bool| -> Feed {
         for &b in buf {
             if b == b'\n' {
                 if *discarding_overlong {
@@ -581,13 +578,7 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
     // looping, or None on EOF / fatal error.
     let read_once = |current_line: &mut Vec<u8>, discarding_overlong: &mut bool| -> Option<Feed> {
         let mut buf = [0u8; 1024];
-        let n = unsafe {
-            libc::read(
-                stdin_fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -599,11 +590,7 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
         if n == 0 {
             return None; // EOF
         }
-        Some(feed(
-            &buf[..n as usize],
-            current_line,
-            discarding_overlong,
-        ))
+        Some(feed(&buf[..n as usize], current_line, discarding_overlong))
     };
 
     loop {
@@ -666,9 +653,7 @@ fn stdin_reader_loop(tx: mpsc::Sender<SamlCapture>, wake_fd: OwnedFd) {
                 }];
                 let wake_rc = unsafe { libc::poll(wake_check.as_mut_ptr(), 1, 0) };
                 if wake_rc > 0
-                    && wake_check[0].revents
-                        & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)
-                        != 0
+                    && wake_check[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
                 {
                     return;
                 }

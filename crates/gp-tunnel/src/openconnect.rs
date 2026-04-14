@@ -64,8 +64,7 @@ impl CancelHandle {
     pub fn cancel(&self) -> Result<(), TunnelError> {
         let buf = [sys::OC_CMD_CANCEL];
         loop {
-            let rc =
-                unsafe { libc::write(self.write_fd, buf.as_ptr() as *const libc::c_void, 1) };
+            let rc = unsafe { libc::write(self.write_fd, buf.as_ptr() as *const libc::c_void, 1) };
             if rc == 1 {
                 return Ok(());
             }
@@ -235,7 +234,12 @@ impl OpenConnectSession {
     pub fn get_ip_info(&self) -> Result<IpInfoSnapshot, TunnelError> {
         let mut info_ptr: *const sys::oc_ip_info = ptr::null();
         let rc = unsafe {
-            sys::openconnect_get_ip_info(self.inner, &mut info_ptr, ptr::null_mut(), ptr::null_mut())
+            sys::openconnect_get_ip_info(
+                self.inner,
+                &mut info_ptr,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
         };
         if rc != 0 {
             return Err(TunnelError::OpenConnect(format!(
@@ -358,4 +362,3 @@ fn ok_or_ffi(rc: libc::c_int, op: &str) -> Result<(), TunnelError> {
         Err(TunnelError::OpenConnect(format!("{op} failed: rc={rc}")))
     }
 }
-

@@ -81,7 +81,11 @@ impl Credential {
                 prelogon_user_auth_cookie,
                 ..
             } => {
-                set(&mut params, "portal-userauthcookie", user_auth_cookie.clone());
+                set(
+                    &mut params,
+                    "portal-userauthcookie",
+                    user_auth_cookie.clone(),
+                );
                 set(
                     &mut params,
                     "portal-prelogonuserauthcookie",

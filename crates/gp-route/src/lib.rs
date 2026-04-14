@@ -88,10 +88,7 @@ pub struct AppliedState {
 #[derive(Debug, Error)]
 pub enum RouteError {
     #[error("ip command failed: {op}: {stderr}")]
-    IpCommand {
-        op: &'static str,
-        stderr: String,
-    },
+    IpCommand { op: &'static str, stderr: String },
 
     #[error("spawning `ip`: {0}")]
     Spawn(#[from] io::Error),
@@ -130,11 +127,7 @@ impl CommandRunner for SystemCommandRunner {
 /// child is SIGKILL'd and reaped before an `io::ErrorKind::TimedOut`
 /// error is returned. Stdout/stderr are captured regardless of
 /// success so the caller can log them.
-fn run_with_timeout(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> io::Result<Output> {
+fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> io::Result<Output> {
     let mut child = Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
@@ -314,11 +307,7 @@ pub fn as_ipv4(addr: IpAddr) -> Option<Ipv4Addr> {
     }
 }
 
-fn run_ip<R: CommandRunner>(
-    runner: &R,
-    op: &'static str,
-    args: &[&str],
-) -> Result<(), RouteError> {
+fn run_ip<R: CommandRunner>(runner: &R, op: &'static str, args: &[&str]) -> Result<(), RouteError> {
     tracing::debug!("gp-route: ip {}", args.join(" "));
     let out = runner.run("ip", args)?;
     if out.status.success() {
@@ -496,14 +485,20 @@ mod tests {
         // Address was just added; first route fails. Rollback must
         // remove the address (no routes to remove yet).
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),              // link up
-            Ok(FakeRunner::ok()),              // mtu
-            Ok(FakeRunner::ok()),              // addr add
-            Ok(FakeRunner::err("nope")),       // route add FAILS
-            Ok(FakeRunner::ok()),              // addr del (rollback)
+            Ok(FakeRunner::ok()),        // link up
+            Ok(FakeRunner::ok()),        // mtu
+            Ok(FakeRunner::ok()),        // addr add
+            Ok(FakeRunner::err("nope")), // route add FAILS
+            Ok(FakeRunner::ok()),        // addr del (rollback)
         ]);
         let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8"])).unwrap_err();
-        assert!(matches!(err, RouteError::IpCommand { op: "route add", .. }));
+        assert!(matches!(
+            err,
+            RouteError::IpCommand {
+                op: "route add",
+                ..
+            }
+        ));
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 5);
         assert_eq!(

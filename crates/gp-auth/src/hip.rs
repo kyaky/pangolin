@@ -49,8 +49,7 @@ pub fn compute_csd_md5(cookie: &str) -> String {
     // empty-string MD5 is harmless, and the subsequent hip check
     // request will fail loudly on the real `authcookie`-less
     // cookie anyway.
-    let mut fields: Vec<(String, String)> =
-        serde_urlencoded::from_str(cookie).unwrap_or_default();
+    let mut fields: Vec<(String, String)> = serde_urlencoded::from_str(cookie).unwrap_or_default();
     const DROP: [&str; 3] = ["authcookie", "preferred-ip", "preferred-ipv6"];
     fields.retain(|(k, _)| !DROP.contains(&k.as_str()));
     // Re-serialize through the same library so percent-encoding

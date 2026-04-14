@@ -51,13 +51,19 @@ mod tests {
     #[test]
     fn parse_needed_yes() {
         let xml = r#"<response><hip-report-needed>yes</hip-report-needed></response>"#;
-        assert_eq!(HipCheckResponse::parse(xml).unwrap(), HipCheckResponse { needed: true });
+        assert_eq!(
+            HipCheckResponse::parse(xml).unwrap(),
+            HipCheckResponse { needed: true }
+        );
     }
 
     #[test]
     fn parse_needed_no() {
         let xml = r#"<response><hip-report-needed>no</hip-report-needed></response>"#;
-        assert_eq!(HipCheckResponse::parse(xml).unwrap(), HipCheckResponse { needed: false });
+        assert_eq!(
+            HipCheckResponse::parse(xml).unwrap(),
+            HipCheckResponse { needed: false }
+        );
     }
 
     #[test]

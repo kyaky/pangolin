@@ -653,16 +653,12 @@ mod tests {
     fn format_as_uuid_rejects_non_hex_32_char() {
         // Exact 32 chars but not hex — must be rejected, not
         // sliced into UUID-shaped garbage.
-        assert!(
-            format_as_uuid("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none()
-        );
+        assert!(format_as_uuid("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_none());
     }
 
     #[test]
     fn format_as_uuid_rejects_dashed_non_hex() {
-        assert!(
-            format_as_uuid("gggggggg-hhhh-iiii-jjjj-kkkkkkkkkkkk").is_none()
-        );
+        assert!(format_as_uuid("gggggggg-hhhh-iiii-jjjj-kkkkkkkkkkkk").is_none());
     }
 
     #[test]
