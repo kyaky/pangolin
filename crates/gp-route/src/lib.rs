@@ -47,9 +47,16 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+/// Default per-`ip(8)` timeout. Route/addr/link operations should
+/// finish in milliseconds on a healthy kernel; 10 seconds is ample
+/// headroom and short enough that a wedged child can't starve the
+/// about-to-start openconnect main loop.
+pub const DEFAULT_IP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Description of how a tun interface should be configured.
 #[derive(Debug, Clone)]
@@ -102,24 +109,77 @@ pub trait CommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error>;
 }
 
-/// Default implementation: just [`Command::new`] + `output()`.
+/// Default implementation: spawn the child, poll with `try_wait`
+/// until completion or [`DEFAULT_IP_COMMAND_TIMEOUT`], then collect
+/// stdout/stderr.
+///
+/// The extra machinery exists to bound how long we'll wait on a
+/// wedged `ip(8)` process. The bare `Command::output()` we used
+/// before had no timeout, which meant a stuck child during `apply`
+/// could starve libopenconnect's about-to-start main loop.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<Output, io::Error> {
-        Command::new(program).args(args).output()
+        run_with_timeout(program, args, DEFAULT_IP_COMMAND_TIMEOUT)
     }
 }
 
-/// Apply a [`TunConfig`] to the live system. Returns an
-/// [`AppliedState`] describing exactly what was installed so the
-/// caller can [`revert`] it later.
-///
-/// The function stops on the first error *during setup* (link up,
-/// MTU, address) — those are fatal for the session. Route installation
-/// failures are collected and reported as a single error at the end
-/// so the caller knows whether every requested route landed.
+/// Run `program args` and wait up to `timeout`. On timeout the
+/// child is SIGKILL'd and reaped before an `io::ErrorKind::TimedOut`
+/// error is returned. Stdout/stderr are captured regardless of
+/// success so the caller can log them.
+fn run_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                // wait_with_output drains the pipes and reaps the
+                // zombie. try_wait already observed exit, so this
+                // returns immediately.
+                return child.wait_with_output().map(|o| Output {
+                    status,
+                    stdout: o.stdout,
+                    stderr: o.stderr,
+                });
+            }
+            None => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "`{program} {}` did not exit within {:?}",
+                            args.join(" "),
+                            timeout
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Apply a [`TunConfig`] to the live system. Returns a fully-
+/// populated [`AppliedState`] on success. On ANY failure during
+/// setup — link up, MTU, address, or route installation — the
+/// function auto-rolls-back everything it installed so far (best-
+/// effort), logs per-step failures via `tracing`, and returns the
+/// triggering error. Callers therefore see an all-or-nothing
+/// transition: either every route is up, or none of them are.
 pub fn apply(config: &TunConfig) -> Result<AppliedState, RouteError> {
     apply_with(&SystemCommandRunner, config)
 }
@@ -141,14 +201,27 @@ pub fn apply_with<R: CommandRunner>(
         ..AppliedState::default()
     };
 
-    // 1. Bring the link up.
+    // Helper: roll back whatever `state` currently reports, then
+    // return the triggering error. Keeps the control flow linear.
+    let rollback_and_fail = |runner: &R, state: &AppliedState, err: RouteError| -> RouteError {
+        if !state.installed_routes.is_empty() || state.installed_addr.is_some() {
+            for rev_err in revert_with(runner, state) {
+                tracing::warn!("gp-route apply-rollback: {rev_err}");
+            }
+        }
+        err
+    };
+
+    // 1. Bring the link up. Nothing in `state` to roll back yet, so
+    //    a failure here just propagates.
     run_ip(
         runner,
         "link up",
         &["link", "set", "dev", &config.ifname, "up"],
     )?;
 
-    // 2. Set MTU if requested.
+    // 2. Set MTU if requested. Still nothing rollback-worthy in
+    //    `state` — gp-route doesn't own the link itself.
     if let Some(mtu) = config.mtu {
         let mtu_str = mtu.to_string();
         run_ip(
@@ -158,7 +231,10 @@ pub fn apply_with<R: CommandRunner>(
         )?;
     }
 
-    // 3. Assign the server-provided IPv4 address, if any.
+    // 3. Assign the server-provided IPv4 address, if any. Record it
+    //    in `state` AFTER it lands so a failure in the next step
+    //    triggers address cleanup, but a failure HERE is still a
+    //    bare `?` because there's nothing to clean up.
     if let Some(addr) = config.ipv4 {
         let addr_cidr = format!("{addr}/32");
         run_ip(
@@ -169,31 +245,22 @@ pub fn apply_with<R: CommandRunner>(
         state.installed_addr = Some(addr);
     }
 
-    // 4. Install routes. Collect failures into one error rather than
-    //    stopping, so partial success is visible in AppliedState.
-    let mut failed: Vec<String> = Vec::new();
+    // 4. Install routes one at a time. On the first failure, roll
+    //    back everything — including any routes already installed
+    //    in this loop — so the caller sees all-or-nothing state.
     for route in &config.routes {
         if let Err(e) = run_ip(
             runner,
             "route add",
             &["route", "add", route, "dev", &config.ifname],
         ) {
-            tracing::warn!("route add {route} on {}: {e}", config.ifname);
-            failed.push(route.clone());
-        } else {
-            state.installed_routes.push(route.clone());
+            tracing::warn!(
+                "gp-route: route add {route} on {} failed ({e}); rolling back",
+                config.ifname
+            );
+            return Err(rollback_and_fail(runner, &state, e));
         }
-    }
-
-    if !failed.is_empty() {
-        return Err(RouteError::IpCommand {
-            op: "route add (one or more)",
-            stderr: format!(
-                "failed to install {} route(s): {}",
-                failed.len(),
-                failed.join(", ")
-            ),
-        });
+        state.installed_routes.push(route.clone());
     }
 
     Ok(state)
@@ -384,15 +451,19 @@ mod tests {
     }
 
     #[test]
-    fn apply_collects_route_failures_into_single_error() {
-        // link up, mtu, addr, route1 (ok), route2 (fail), route3 (ok)
+    fn apply_auto_rolls_back_on_route_failure() {
+        // Setup:     link up, mtu, addr, route1 (ok), route2 (fail).
+        // Rollback:  route del route1, addr del.
+        // We expect 7 calls total, and the returned error must
+        // refer to the failing route add (not a rollback step).
         let runner = FakeRunner::new(vec![
-            Ok(FakeRunner::ok()),
-            Ok(FakeRunner::ok()),
-            Ok(FakeRunner::ok()),
-            Ok(FakeRunner::ok()),
-            Ok(FakeRunner::err("route2 broken")),
-            Ok(FakeRunner::ok()),
+            Ok(FakeRunner::ok()),              // link up
+            Ok(FakeRunner::ok()),              // mtu
+            Ok(FakeRunner::ok()),              // addr add
+            Ok(FakeRunner::ok()),              // route add 10.0.0.0/8
+            Ok(FakeRunner::err("route2 bad")), // route add 172.16.0.0/12 FAILS
+            Ok(FakeRunner::ok()),              // route del 10.0.0.0/8 (rollback)
+            Ok(FakeRunner::ok()),              // addr del (rollback)
         ]);
         let err = apply_with(
             &runner,
@@ -401,11 +472,44 @@ mod tests {
         .unwrap_err();
         match err {
             RouteError::IpCommand { op, stderr } => {
-                assert_eq!(op, "route add (one or more)");
-                assert!(stderr.contains("172.16.0.0/12"), "got: {stderr}");
+                assert_eq!(op, "route add");
+                assert!(stderr.contains("route2 bad"), "got: {stderr}");
             }
             other => panic!("unexpected error: {other:?}"),
         }
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 7, "call sequence: {:#?}", calls);
+        assert_eq!(
+            calls[5],
+            vec!["ip", "route", "del", "10.0.0.0/8", "dev", "tun7"],
+            "first rollback step must be `route del` for the successful route"
+        );
+        assert_eq!(
+            calls[6],
+            vec!["ip", "addr", "del", "10.1.2.3/32", "dev", "tun7"],
+            "second rollback step must be `addr del`"
+        );
+    }
+
+    #[test]
+    fn apply_rolls_back_address_on_first_route_failure() {
+        // Address was just added; first route fails. Rollback must
+        // remove the address (no routes to remove yet).
+        let runner = FakeRunner::new(vec![
+            Ok(FakeRunner::ok()),              // link up
+            Ok(FakeRunner::ok()),              // mtu
+            Ok(FakeRunner::ok()),              // addr add
+            Ok(FakeRunner::err("nope")),       // route add FAILS
+            Ok(FakeRunner::ok()),              // addr del (rollback)
+        ]);
+        let err = apply_with(&runner, &cfg(vec!["10.0.0.0/8"])).unwrap_err();
+        assert!(matches!(err, RouteError::IpCommand { op: "route add", .. }));
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(
+            calls[4],
+            vec!["ip", "addr", "del", "10.1.2.3/32", "dev", "tun7"]
+        );
     }
 
     #[test]

@@ -881,19 +881,25 @@ fn run_tunnel(
         .context("setup_tun_device")?;
 
     // Snapshot everything the main thread needs for its IPC server.
-    // Calling get_ip_info is only valid right now, before any further
-    // libopenconnect API calls — we copy out, we do not retain.
+    // `get_ip_info` is only valid on this thread and its string
+    // pointers are invalidated on the next libopenconnect call — we
+    // copy out into an owned `IpInfoSnapshot` and never retain the
+    // raw pointers.
     let ifname = session.get_ifname();
     let ip_info = session.get_ip_info().ok();
-    let _ = ready_tx.send(TunnelReady {
-        ifname: ifname.clone(),
-        ip_info: ip_info.clone(),
-    });
 
     // Native route installation — only when the caller provided
     // `--only` routes AND didn't also pass an explicit --vpnc-script
     // (the caller's resolve logic collapses those cases, but double-
     // check here defensively).
+    //
+    // NOTE: gp-route runs BEFORE we send `TunnelReady`. That means
+    // `pgn status` reports `Connecting` until the routes are fully
+    // installed and only flips to `Connected` once apply() has
+    // succeeded. Users never see a Connected state with broken
+    // routing, and the Connecting window correctly covers the time
+    // when cancellation via the cmd pipe is not yet polled by the
+    // main loop.
     let applied_state = if !split_routes.is_empty() && vpnc_script.is_none() {
         let ifname = ifname.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -920,6 +926,15 @@ fn run_tunnel(
     } else {
         None
     };
+
+    // Now that routes (if any) are installed, announce readiness.
+    // Dropping this Sender on the error path is fine — the main
+    // thread's recv will return Err and we'll be picked up via
+    // `done_rx` instead.
+    let _ = ready_tx.send(TunnelReady {
+        ifname: ifname.clone(),
+        ip_info: ip_info.clone(),
+    });
 
     // The blocking main loop. Returns when cancelled or the remote drops.
     let run_res = session.run(60, 10);

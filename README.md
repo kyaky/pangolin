@@ -25,9 +25,10 @@ There are two main open-source options today:
 | Tunnel | Native ESP/HTTPS | Native (via libopenconnect) | Native (via libopenconnect) |
 | SAML auth on a server (no display) | ❌ paste mode only | ❌ requires WebKitGTK window | ✅ **headless paste mode** |
 | Prisma Access cloud-auth (`globalprotectcallback:`) | ✅ | ✅ | ✅ |
-| Split tunnel without `vpn-slice` | ❌ | ❌ | ✅ **bundled, hostname-aware** |
+| Split tunnel without `vpn-slice` | ❌ | ❌ | ✅ **native, hostname-aware** |
+| Client-managed routes (`ip(8)` from Rust) | ❌ | ❌ shell script | ✅ `gp-route` |
 | CLI-first, daemon-friendly | ⚠️ | ⚠️ GUI-first | ✅ goal |
-| HIP report, multi-portal, native gp-route | partial | partial | 🚧 roadmap |
+| HIP report, multi-portal, native DNS | partial | partial | 🚧 roadmap |
 
 The two things that already make `pangolin` worth using over the
 alternatives:
@@ -215,7 +216,7 @@ policy. We never reimplement ESP/UDP, never shell out to the
 - Prisma Access `globalprotectcallback:` JWT capture
 - `pgn connect` end-to-end: prelogin → SAML → portal config → gateway
   login → CSTP → TUN → DPD keepalives
-- Bundled minimal vpnc-script + `--only` split tunnel
+- `--only` client-controlled split tunnel, hostname + CIDR aware
 - Clean Ctrl-C cancellation via `openconnect_setup_cmd_pipe`
 
 ### Phase 2 — next
