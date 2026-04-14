@@ -13,10 +13,11 @@ use gp_auth::{
 };
 use gp_ipc::{
     bind_server, build_snapshot, client_roundtrip, read_request, write_response, IpcError,
-    Request as IpcRequest, Response as IpcResponse, StateSnapshotBase, DEFAULT_SOCKET_PATH,
+    Request as IpcRequest, Response as IpcResponse, SessionState, StateSnapshotBase,
+    DEFAULT_SOCKET_PATH,
 };
 use gp_proto::{AuthCookie, ClientOs, GatewayLoginResult, GpParams};
-use gp_tunnel::OpenConnectSession;
+use gp_tunnel::{IpInfoSnapshot, OpenConnectSession};
 
 #[derive(Parser)]
 #[command(name = "pgn", version, about = "Pangolin GlobalProtect VPN client")]
@@ -158,12 +159,25 @@ async fn status(json: bool) -> Result<()> {
             } else {
                 let mins = s.uptime_seconds / 60;
                 let secs = s.uptime_seconds % 60;
-                println!("state:     connected");
+                let state_str = match s.state {
+                    SessionState::Connected => "connected",
+                    SessionState::Connecting => "connecting",
+                    SessionState::Reconnecting => "reconnecting",
+                };
+                println!("state:     {state_str}");
                 println!("portal:    {}", s.portal);
                 println!("gateway:   {}", s.gateway);
                 println!("user:      {}", s.user);
                 println!("os-spoof:  {}", s.reported_os);
                 println!("uptime:    {}m{}s", mins, secs);
+                println!(
+                    "interface: {}",
+                    s.tun_ifname.as_deref().unwrap_or("(unknown)")
+                );
+                println!(
+                    "local-ip:  {}",
+                    s.local_ipv4.as_deref().unwrap_or("(none)")
+                );
                 if s.routes.is_empty() {
                     println!("routes:    (default — script-managed)");
                 } else {
@@ -408,52 +422,60 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         None => Vec::new(),
     };
     if !routes.is_empty() {
-        tracing::info!("split tunnel: {} route(s) — {}", routes.len(), routes.join(" "));
-        // SAFETY: set_var is only unsound under concurrent access. We're
-        // on the async main thread before spawning the tunnel thread, so
-        // no other thread is reading the environment yet.
-        std::env::set_var("PANGOLIN_ROUTES", routes.join(" "));
+        tracing::info!(
+            "split tunnel: {} route(s) resolved — {}",
+            routes.len(),
+            routes.join(" ")
+        );
     }
 
     // 8. Hand off to libopenconnect via gp-tunnel.
+    //
+    // Decision matrix for the tun-device configuration path:
+    //
+    //   --vpnc-script <path>   → pass through as-is. The user is
+    //                            opting into the traditional
+    //                            libopenconnect behaviour (server-
+    //                            pushed routes, DNS, etc.). `--only`
+    //                            is ignored on this path.
+    //   no --vpnc-script,
+    //   --only <targets>       → pass NULL to libopenconnect so no
+    //                            script runs; gp-route installs
+    //                            `--only` routes natively from Rust
+    //                            after `setup_tun_device` returns.
+    //   no --vpnc-script,
+    //   no --only              → fall back to `/etc/vpnc/vpnc-script`
+    //                            if it exists; otherwise NULL and the
+    //                            interface comes up but does no
+    //                            routing (safe default for testing).
     let cookie_str = build_openconnect_cookie(&auth_cookie);
     let oc_os = map_os_to_openconnect(os);
     let gateway_host = gateway.address.clone();
 
-    // The bundled-script guard, if any, must outlive `run_tunnel` so the
-    // file isn't unlinked while libopenconnect is still calling it.
-    let bundled_script_guard: Option<BundledVpncScript>;
-    let script: Option<String> = match vpnc_script {
-        Some(explicit) => {
-            bundled_script_guard = None;
-            Some(explicit)
-        }
-        None if !routes.is_empty() => {
-            let g = install_bundled_vpnc_script()
-                .context("installing bundled vpnc-script for --only")?;
-            let p = g.path_str()
-                .context("bundled vpnc-script path is not utf-8")?
-                .to_string();
-            bundled_script_guard = Some(g);
-            Some(p)
-        }
-        None => {
-            bundled_script_guard = None;
-            default_vpnc_script()
-        }
+    let script: Option<String> = match (vpnc_script.as_ref(), routes.is_empty()) {
+        (Some(explicit), _) => Some(explicit.clone()),
+        (None, false) => None, // native gp-route path
+        (None, true) => default_vpnc_script(),
     };
 
     tracing::info!(
-        "starting tunnel: gateway={gateway_host} os={oc_os} vpnc_script={:?}",
-        script
+        "starting tunnel: gateway={gateway_host} os={oc_os} vpnc_script={:?} native_routes={}",
+        script,
+        routes.len()
     );
 
-    // libopenconnect's main loop blocks, so run it on a dedicated OS thread.
-    // The session itself is !Send (raw pointer) so we construct it inside the
-    // thread and hand the cancel handle back via a oneshot.
-    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    // Channels used by `run_tunnel` to talk back to us:
+    //  * `cancel_rx` receives the CancelHandle as soon as the session
+    //    is created — available before any blocking work so Ctrl-C
+    //    can interrupt the CSTP / setup_tun path.
+    //  * `ready_rx` receives a TunnelReady once setup_tun_device has
+    //    succeeded — carries the tun ifname + libopenconnect's ip_info.
+    //  * `done_rx` receives the tunnel thread's final Result.
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<TunnelReady>();
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<Result<()>>();
 
+    let split_routes = routes.clone();
     let tunnel_thread = std::thread::Builder::new()
         .name("pgn-tunnel".into())
         .spawn(move || {
@@ -462,29 +484,76 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 &cookie_str,
                 oc_os,
                 script.as_deref(),
-                handle_tx,
+                split_routes,
+                cancel_tx,
+                ready_tx,
             );
             let _ = done_tx.send(result);
         })
         .context("spawning tunnel thread")?;
 
-    // Receive the cancel handle from the tunnel thread (available as soon as
-    // the session is created; before the blocking main loop starts).
-    let cancel_handle = handle_rx
-        .recv()
-        .context("tunnel thread failed before signalling readiness")?;
+    // 9. Wait for the cancel handle. If the tunnel thread failed before
+    //    even getting this far, `recv` returns Err and we propagate via
+    //    the `done_rx` path below.
+    let cancel_handle = match cancel_rx.recv() {
+        Ok(c) => c,
+        Err(_) => {
+            // The tunnel thread exited before sending the cancel handle.
+            // Pick up its error from done_rx.
+            let _ = tunnel_thread.join();
+            done_rx
+                .await
+                .context("tunnel thread died without reporting a result")??;
+            return Ok(());
+        }
+    };
 
-    // Spawn the IPC server so `pgn status` / `pgn disconnect` from another
-    // shell can talk to this session.
-    //
-    // `started_at_unix` is captured ONCE here from the wall clock so the
-    // reported session start time stays stable across `pgn status` queries
-    // — NTP steps and manual clock changes during the session won't
-    // drift it.
+    // 10. Wait for setup_tun_device to finish, then spawn the IPC server
+    //     with the real ifname / local IP. `recv_timeout` on a blocking
+    //     channel from inside a tokio task is awkward, so we race a
+    //     `spawn_blocking` call against ctrl_c and done_rx.
+    let tunnel_ready = tokio::select! {
+        res = tokio::task::spawn_blocking(move || ready_rx.recv()) => {
+            match res {
+                Ok(Ok(ready)) => ready,
+                Ok(Err(_)) | Err(_) => {
+                    // Tunnel thread failed before setup_tun_device finished.
+                    done_rx.await.context("tunnel thread did not report exit")??;
+                    let _ = tunnel_thread.join();
+                    return Ok(());
+                }
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl-C received during tunnel setup, cancelling...");
+            if let Err(e) = cancel_handle.cancel() {
+                tracing::warn!("cancel failed: {e}");
+            }
+            done_rx.await.context("tunnel thread did not report exit")??;
+            let _ = tunnel_thread.join();
+            return Ok(());
+        }
+        res = &mut done_rx => {
+            let _ = tunnel_thread.join();
+            return match res {
+                Ok(r) => r,
+                Err(_) => Err(anyhow::anyhow!("tunnel thread panicked")),
+            };
+        }
+    };
+
+    // 11. Build the IPC state snapshot from auth info + tunnel state.
+    //     `started_at_unix` is captured ONCE here so subsequent NTP
+    //     steps or manual wall-clock changes don't make `pgn status`
+    //     report a drifting start time.
     let started_at_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let local_ipv4 = tunnel_ready
+        .ip_info
+        .as_ref()
+        .and_then(|i| i.addr.clone());
     let ipc_base = StateSnapshotBase {
         portal: portal_url.clone(),
         gateway: gateway.address.clone(),
@@ -492,6 +561,9 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         reported_os: oc_os.to_string(),
         routes: routes.clone(),
         started_at_unix,
+        tun_ifname: tunnel_ready.ifname.clone(),
+        local_ipv4,
+        state: SessionState::Connected,
     };
     let ipc_start = Instant::now();
     let (ipc_disconnect_tx, mut ipc_disconnect_rx) =
@@ -544,10 +616,6 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         None => done_rx.await.context("tunnel thread did not report exit")?,
     };
     let _ = tunnel_thread.join();
-    // Drop the bundled-script guard AFTER the tunnel thread is joined
-    // so the file is only unlinked once libopenconnect has finished
-    // invoking it.
-    drop(bundled_script_guard);
     final_res
 }
 
@@ -681,100 +749,12 @@ fn default_vpnc_script() -> Option<String> {
     None
 }
 
-/// Bundled minimal vpnc-script. Compiled into the binary so pgn doesn't
-/// need anything installed on disk.
-const BUNDLED_VPNC_SCRIPT: &str =
-    include_str!("../../../scripts/pangolin-vpnc-script.sh");
-
-/// Owned guard for the bundled vpnc-script we install on disk. Drop
-/// unlinks the file so we don't leave dead scripts lying around in
-/// `/tmp` or `$XDG_RUNTIME_DIR` between runs.
-struct BundledVpncScript {
-    path: std::path::PathBuf,
-}
-
-impl BundledVpncScript {
-    /// Return the path as a `&str` for downstream APIs that take string
-    /// paths. Errors (rather than panics) if `XDG_RUNTIME_DIR` happens
-    /// to contain non-UTF-8 bytes — rare but legal on Linux.
-    fn path_str(&self) -> Result<&str> {
-        self.path.to_str().ok_or_else(|| {
-            anyhow::anyhow!(
-                "bundled vpnc-script path is not valid UTF-8: {}",
-                self.path.display()
-            )
-        })
-    }
-}
-
-impl Drop for BundledVpncScript {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Write the bundled vpnc-script to a runtime location and return a
-/// guard that owns its lifetime. The path is unique per invocation
-/// (PID + monotonic nanos) and the file is created with `O_CREAT |
-/// O_EXCL` and mode `0700` to defeat predictable-path symlink races
-/// — the previous version of this function used a fixed filename and
-/// was vulnerable.
-///
-/// `$XDG_RUNTIME_DIR` is preferred (per-user, tmpfs, mode 0700 on most
-/// distros). `/tmp` is the fallback; even then the `O_EXCL` + unique
-/// suffix combination keeps things safe.
-fn install_bundled_vpnc_script() -> Result<BundledVpncScript> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-
-    let pid = std::process::id();
-    // Nanos since boot via CLOCK_MONOTONIC, mixed with a thread-local
-    // counter to defend against same-nanosecond collisions.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_else(|_| pid as u128);
-
-    // Try a few suffix variations until O_EXCL succeeds (handles the
-    // astronomically unlikely collision case without panicking).
-    let mut last_err: Option<std::io::Error> = None;
-    for attempt in 0u32..16 {
-        let name = format!("pangolin-vpnc-{pid}-{nanos}-{attempt}.sh");
-        let path = dir.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true) // O_CREAT | O_EXCL
-            .mode(0o700) // owner rwx only — refuse group/other access
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(BUNDLED_VPNC_SCRIPT.as_bytes())
-                    .with_context(|| format!("writing {}", path.display()))?;
-                return Ok(BundledVpncScript { path });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                last_err = Some(e);
-                continue;
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "creating bundled vpnc-script at {}: {e}",
-                    path.display()
-                ));
-            }
-        }
-    }
-    Err(anyhow::anyhow!(
-        "could not create a unique bundled vpnc-script in {} after 16 attempts: {:?}",
-        dir.display(),
-        last_err
-    ))
-}
+// The bundled vpnc-script shim that earlier releases installed under
+// `$XDG_RUNTIME_DIR/pangolin-vpnc-*.sh` is gone. Native route
+// management in `gp-route` replaces it, driven directly from the
+// tunnel thread after `setup_tun_device` returns. Users who want
+// the classic libopenconnect script behaviour still have
+// `--vpnc-script /path/to/script`.
 
 /// Parse a `--only` spec into a list of `ip/prefix` route strings suitable
 /// for `ip route add`.
@@ -841,16 +821,39 @@ async fn resolve_only_spec(spec: &str) -> Result<Vec<String>> {
     Ok(routes)
 }
 
+/// State captured from libopenconnect after `setup_tun_device`
+/// succeeds. Flows from the tunnel thread back to the main thread so
+/// the IPC server can advertise the real tun ifname, local IP, etc.
+struct TunnelReady {
+    ifname: Option<String>,
+    ip_info: Option<IpInfoSnapshot>,
+}
+
 /// Drive the openconnect session on its own OS thread.
 ///
-/// On success, sends a `CancelHandle` through `handle_tx` before entering the
-/// blocking main loop, so the async runtime can trigger cancellation.
+/// Sends two messages back to the main thread over separate channels:
+///
+/// * `cancel_tx` receives a `CancelHandle` as soon as the session has
+///   been created (before any blocking work), so Ctrl-C can interrupt
+///   the slow CSTP / setup_tun path.
+/// * `ready_tx` receives a [`TunnelReady`] snapshot once
+///   `setup_tun_device` completes, so the main thread can populate
+///   the `StateSnapshotBase` for the IPC server and start serving
+///   `pgn status` / `pgn disconnect`.
+///
+/// If `split_routes` is non-empty, the thread uses `gp-route` to
+/// install those routes natively on the tun interface after
+/// `setup_tun_device` returns — no shell script involvement. Routes
+/// are reverted on the way out.
+#[allow(clippy::too_many_arguments)]
 fn run_tunnel(
     gateway_host: &str,
     cookie: &str,
     os: &str,
     vpnc_script: Option<&str>,
-    handle_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
+    split_routes: Vec<String>,
+    cancel_tx: std::sync::mpsc::Sender<gp_tunnel::CancelHandle>,
+    ready_tx: std::sync::mpsc::Sender<TunnelReady>,
 ) -> Result<()> {
     let mut session =
         OpenConnectSession::new("PAN GlobalProtect").context("creating openconnect session")?;
@@ -860,11 +863,13 @@ fn run_tunnel(
     session.set_os_spoof(os).context("set_os_spoof")?;
     session.set_cookie(cookie).context("set_cookie")?;
 
-    // Hand the cancel fd out before we start the blocking work.
+    // Hand the cancel fd out BEFORE any blocking work so Ctrl-C can
+    // interrupt the slow CSTP / TUN setup path. Receiver drops it on
+    // our error path.
     let cancel = session
         .cancel_handle()
         .expect("cancel handle must be available");
-    handle_tx
+    cancel_tx
         .send(cancel)
         .context("sending cancel handle to main thread")?;
 
@@ -875,6 +880,59 @@ fn run_tunnel(
         .setup_tun_device(vpnc_script)
         .context("setup_tun_device")?;
 
-    session.run(60, 10).context("openconnect mainloop")?;
+    // Snapshot everything the main thread needs for its IPC server.
+    // Calling get_ip_info is only valid right now, before any further
+    // libopenconnect API calls — we copy out, we do not retain.
+    let ifname = session.get_ifname();
+    let ip_info = session.get_ip_info().ok();
+    let _ = ready_tx.send(TunnelReady {
+        ifname: ifname.clone(),
+        ip_info: ip_info.clone(),
+    });
+
+    // Native route installation — only when the caller provided
+    // `--only` routes AND didn't also pass an explicit --vpnc-script
+    // (the caller's resolve logic collapses those cases, but double-
+    // check here defensively).
+    let applied_state = if !split_routes.is_empty() && vpnc_script.is_none() {
+        let ifname = ifname.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "libopenconnect did not report a tun ifname; cannot install native routes"
+            )
+        })?;
+        let ipv4 = ip_info
+            .as_ref()
+            .and_then(|i| i.addr.as_deref())
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok());
+        let mtu = ip_info.as_ref().and_then(|i| i.mtu);
+        let config = gp_route::TunConfig {
+            ifname,
+            ipv4,
+            mtu,
+            routes: split_routes.clone(),
+        };
+        tracing::info!(
+            "gp-route: applying {} route(s) natively on {}",
+            split_routes.len(),
+            config.ifname
+        );
+        Some(gp_route::apply(&config).context("gp-route apply")?)
+    } else {
+        None
+    };
+
+    // The blocking main loop. Returns when cancelled or the remote drops.
+    let run_res = session.run(60, 10);
+
+    // Best-effort cleanup of anything gp-route installed. Never
+    // short-circuit on cleanup errors — log them, return the original
+    // main loop result.
+    if let Some(state) = applied_state {
+        for err in gp_route::revert(&state) {
+            tracing::warn!("gp-route revert: {err}");
+        }
+    }
+
+    run_res.context("openconnect mainloop")?;
     Ok(())
 }

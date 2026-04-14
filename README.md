@@ -38,12 +38,15 @@ alternatives:
    No display, no embedded WebKit, no `xvfb` workaround. The yuezk
    client cannot do this — its `gpauth` is hard-coded to spawn a
    webkit2gtk window.
-2. **Client-controlled split tunnel.** `pgn connect --only
-   10.0.0.0/8,intranet.example.com` resolves the hostnames before the
-   tunnel comes up, then installs *only* those routes through the VPN.
-   The default route is left untouched, so your SSH session (and
-   anything else not explicitly routed) keeps using your normal
-   network. No external `vpn-slice` install required.
+2. **Client-controlled split tunnel, managed natively.** `pgn connect
+   --only 10.0.0.0/8,intranet.example.com` resolves the hostnames
+   before the tunnel comes up, then the `gp-route` crate installs
+   *only* those routes through the VPN using `ip(8)` directly from
+   Rust — no shell vpnc-script in the loop, no `vpn-slice`
+   dependency, no `CISCO_SPLIT_INC_*` env-var plumbing. The default
+   route is left untouched, so your SSH session (and anything else
+   not explicitly routed) keeps using its normal path. Routes are
+   reverted on disconnect.
 
 A graphical webview path is still available for users who prefer it
 (`--auth-mode webview`, default when you have a display).
@@ -189,7 +192,9 @@ Both support `--json` for machine-readable output.
 | `gp-auth` | Authentication providers (`Password`, `SamlBrowser`, `SamlPaste`) and the HTTP client for portal/gateway login |
 | `gp-tunnel` | Safe wrapper around `libopenconnect`. Owns the VPN session lifecycle, cancellation via `openconnect_setup_cmd_pipe`, and a C trampoline for libopenconnect's variadic progress callback (stable Rust can't define one) |
 | `gp-openconnect-sys` | Raw bindgen FFI bindings + the C trampoline shim |
-| `gp-config`, `gp-hip`, `gp-dns`, `gp-route` | Currently mostly stubs — see the roadmap |
+| `gp-route` | Native route / address / link management via `ip(8)`. Installs and reverts split-tunnel routes after `setup_tun_device` returns — no shell script in the loop |
+| `gp-ipc` | Unix control socket protocol (serde JSON) for `pgn status` / `pgn disconnect` |
+| `gp-config`, `gp-hip`, `gp-dns` | Still stubs — see the roadmap |
 | `bins/pgn` | The CLI, `tokio`-based |
 
 Architecture rule of thumb: **`libopenconnect` handles the tunnel,
@@ -216,10 +221,11 @@ policy. We never reimplement ESP/UDP, never shell out to the
 ### Phase 2 — next
 
 - ~~`pgn status` / `pgn disconnect` via unix socket~~ ✅
+- ~~Native route management (`gp-route`) — `ip(8)` for now, rtnetlink
+  later~~ ✅
 - HIP report generation (`gp-hip`)
-- Native route + DNS management (`gp-route` / `gp-dns`) — replace the
-  bundled vpnc-script entirely with rtnetlink + systemd-resolved /
-  resolvconf / direct backends, à la Tailscale
+- Native DNS management (`gp-dns`) — systemd-resolved / resolvconf /
+  direct backends
 - Multi-portal profiles (`pgn portal add`, `pgn portal use`)
 - Auto-reconnect with exponential backoff
 - systemd unit

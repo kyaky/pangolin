@@ -70,11 +70,26 @@ pub enum Response {
     Error { message: String },
 }
 
+/// Coarse-grained session state. Clients use this to render UX — the
+/// set is intentionally small and not a strict state machine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    /// Auth is done, libopenconnect session created, but CSTP/TUN
+    /// setup hasn't finished yet.
+    Connecting,
+    /// CSTP is up, tun device is configured, routes installed.
+    Connected,
+    /// Reserved for a future auto-reconnect path.
+    Reconnecting,
+}
+
 /// Point-in-time view of the running session.
 ///
 /// Everything here is built up-front from the auth result and a start
-/// `Instant`. Nothing mutates while the session runs — no locking
-/// required on the server side.
+/// `Instant`. `state` and `tun_ifname` / `local_ipv4` become available
+/// after setup_tun_device returns; `uptime_seconds` is derived per
+/// query from a stored Instant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
     /// Portal URL the session is bound to.
@@ -85,12 +100,28 @@ pub struct StateSnapshot {
     pub user: String,
     /// Reported OS string that was sent to the gateway (`"win"`, …).
     pub reported_os: String,
-    /// Seconds since the tunnel came up.
+    /// Seconds since the session was created. Stable across wall-clock jumps.
     pub uptime_seconds: u64,
     /// Unix timestamp (seconds) the session started, or 0 if unknown.
     pub started_at_unix: u64,
-    /// Comma-separated list of installed split-tunnel routes, or "default" if none.
+    /// Split-tunnel CIDRs installed by `gp-route`. Empty means "default
+    /// routing; whatever the vpnc-script did."
     pub routes: Vec<String>,
+    /// Tun interface libopenconnect created, e.g. `"tun0"`. `None`
+    /// until setup_tun_device finishes.
+    #[serde(default)]
+    pub tun_ifname: Option<String>,
+    /// Server-assigned IPv4 on the tun interface.
+    #[serde(default)]
+    pub local_ipv4: Option<String>,
+    /// Coarse-grained state. Defaults to `Connected` for backward
+    /// compatibility with older snapshots that didn't have this field.
+    #[serde(default = "default_session_state")]
+    pub state: SessionState,
+}
+
+fn default_session_state() -> SessionState {
+    SessionState::Connected
 }
 
 /// Ensure [`DEFAULT_SOCKET_DIR`] (or the parent of `path`) exists with
@@ -208,6 +239,9 @@ pub fn build_snapshot(
         uptime_seconds: started_at.elapsed().as_secs(),
         started_at_unix: base.started_at_unix,
         routes: base.routes.clone(),
+        tun_ifname: base.tun_ifname.clone(),
+        local_ipv4: base.local_ipv4.clone(),
+        state: base.state,
     }
 }
 
@@ -225,6 +259,9 @@ pub struct StateSnapshotBase {
     pub reported_os: String,
     pub routes: Vec<String>,
     pub started_at_unix: u64,
+    pub tun_ifname: Option<String>,
+    pub local_ipv4: Option<String>,
+    pub state: SessionState,
 }
 
 #[cfg(test)]
@@ -253,6 +290,9 @@ mod tests {
                 uptime_seconds: 42,
                 started_at_unix: 1_700_000_000,
                 routes: vec!["10.0.0.0/8".into()],
+                tun_ifname: Some("tun0".into()),
+                local_ipv4: Some("10.1.2.3".into()),
+                state: SessionState::Connected,
             }),
         ];
         for resp in resps {

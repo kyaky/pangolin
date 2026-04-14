@@ -205,6 +205,67 @@ impl OpenConnectSession {
         ok_or_ffi(rc, "openconnect_setup_tun_device")
     }
 
+    /// Return the tun interface name libopenconnect assigned to this
+    /// session (e.g. `"tun0"`), once [`setup_tun_device`] has been
+    /// called successfully. Returns `None` before that, or if libopen-
+    /// connect has no name to report.
+    ///
+    /// [`setup_tun_device`]: Self::setup_tun_device
+    pub fn get_ifname(&self) -> Option<String> {
+        let ptr = unsafe { sys::openconnect_get_ifname(self.inner) };
+        if ptr.is_null() {
+            return None;
+        }
+        unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    /// Read the server-provided IP configuration (IPv4/IPv6 address,
+    /// netmask, MTU, gateway) into a fully-owned [`IpInfoSnapshot`].
+    ///
+    /// The underlying `openconnect_get_ip_info` returns pointers into
+    /// state owned by libopenconnect which become invalid on the next
+    /// API call — we copy every field into Rust-owned strings before
+    /// returning, so the snapshot is safe to hold across later calls.
+    ///
+    /// Must be called from the same OS thread as the session, per
+    /// `openconnect.h`.
+    pub fn get_ip_info(&self) -> Result<IpInfoSnapshot, TunnelError> {
+        let mut info_ptr: *const sys::oc_ip_info = ptr::null();
+        let rc = unsafe {
+            sys::openconnect_get_ip_info(self.inner, &mut info_ptr, ptr::null_mut(), ptr::null_mut())
+        };
+        if rc != 0 {
+            return Err(TunnelError::OpenConnect(format!(
+                "openconnect_get_ip_info returned {rc}"
+            )));
+        }
+        if info_ptr.is_null() {
+            return Err(TunnelError::OpenConnect(
+                "openconnect_get_ip_info produced a NULL info pointer".into(),
+            ));
+        }
+        // SAFETY: libopenconnect guarantees the pointer is valid until
+        // we call the next libopenconnect API. We only read fields and
+        // copy strings; no pointers are retained.
+        let info = unsafe { &*info_ptr };
+        Ok(IpInfoSnapshot {
+            addr: cstr_to_opt_string(info.addr),
+            netmask: cstr_to_opt_string(info.netmask),
+            addr6: cstr_to_opt_string(info.addr6),
+            netmask6: cstr_to_opt_string(info.netmask6),
+            gateway_addr: cstr_to_opt_string(info.gateway_addr),
+            domain: cstr_to_opt_string(info.domain),
+            mtu: if info.mtu > 0 {
+                Some(info.mtu as u16)
+            } else {
+                None
+            },
+        })
+    }
+
     /// Run the tunnel main loop. Blocks until cancelled or the tunnel drops.
     ///
     /// `reconnect_timeout` is passed straight through to openconnect; set to 0
@@ -241,6 +302,41 @@ impl Drop for OpenConnectSession {
 }
 
 // OpenConnectSession is !Send + !Sync by default via the raw pointer field.
+
+/// Rust-owned snapshot of libopenconnect's `oc_ip_info`. Every string
+/// field is copied out of libopenconnect's internal storage so the
+/// snapshot is safe to hold across subsequent API calls (which would
+/// otherwise invalidate the pointers the raw struct returns).
+#[derive(Debug, Clone, Default)]
+pub struct IpInfoSnapshot {
+    /// IPv4 address assigned by the server, e.g. `"10.1.2.3"`.
+    pub addr: Option<String>,
+    /// IPv4 netmask in dotted-quad form, e.g. `"255.255.255.255"`.
+    pub netmask: Option<String>,
+    /// IPv6 address in `"addr/prefixlen"` form.
+    pub addr6: Option<String>,
+    /// IPv6 netmask — libopenconnect stores the address+mask together.
+    pub netmask6: Option<String>,
+    /// Gateway address (derived locally by libopenconnect from
+    /// `getnameinfo`, not server-controlled).
+    pub gateway_addr: Option<String>,
+    /// Search domain pushed by the server, if any.
+    pub domain: Option<String>,
+    /// MTU reported by the server. `None` if libopenconnect had to
+    /// calculate it locally (which it logs as "No MTU received").
+    pub mtu: Option<u16>,
+}
+
+fn cstr_to_opt_string(ptr: *const libc::c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `ptr` is a valid C string.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
+}
 
 fn ok_or_ffi(rc: libc::c_int, op: &str) -> Result<(), TunnelError> {
     if rc == 0 {

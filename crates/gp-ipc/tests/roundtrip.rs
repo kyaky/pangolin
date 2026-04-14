@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use gp_ipc::{
     bind_server, build_snapshot, client_roundtrip, read_request, write_response, Request,
-    Response, StateSnapshotBase,
+    Response, SessionState, StateSnapshotBase,
 };
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
@@ -67,6 +67,9 @@ fn base() -> StateSnapshotBase {
         reported_os: "win".into(),
         routes: vec!["10.0.0.0/8".into(), "192.168.1.0/24".into()],
         started_at_unix: 1_700_000_000,
+        tun_ifname: Some("tun0".into()),
+        local_ipv4: Some("10.0.0.42".into()),
+        state: SessionState::Connected,
     }
 }
 
@@ -90,6 +93,9 @@ async fn status_returns_snapshot_fields() {
             assert_eq!(s.user, "alice@example.com");
             assert_eq!(s.reported_os, "win");
             assert_eq!(s.routes, vec!["10.0.0.0/8", "192.168.1.0/24"]);
+            assert_eq!(s.tun_ifname.as_deref(), Some("tun0"));
+            assert_eq!(s.local_ipv4.as_deref(), Some("10.0.0.42"));
+            assert_eq!(s.state, SessionState::Connected);
             // uptime should be a small non-negative number.
             assert!(s.uptime_seconds < 10);
         }

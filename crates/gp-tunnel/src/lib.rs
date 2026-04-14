@@ -8,7 +8,7 @@ use thiserror::Error;
 
 mod openconnect;
 
-pub use openconnect::{CancelHandle, OpenConnectSession};
+pub use openconnect::{CancelHandle, IpInfoSnapshot, OpenConnectSession};
 
 /// Tunnel errors.
 #[derive(Debug, Error)]
