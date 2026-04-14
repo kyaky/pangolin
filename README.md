@@ -160,10 +160,22 @@ Options:
       --auth-mode <MODE>        webview | paste (default: webview)
       --saml-port <PORT>        Local port for paste-mode HTTP server (29999)
       --only <CIDR|IP|HOST>     Comma-separated split-tunnel targets
+
+pgn status                     Show the running session (or "disconnected")
+pgn disconnect                 Tear down the running session
 ```
 
-Other subcommands (`pgn status`, `pgn disconnect`) currently print a
-"not yet implemented" message — see the roadmap.
+`status` and `disconnect` talk to the running `pgn connect` process
+over a Unix control socket at `/run/pangolin/pangolin.sock` (mode
+`0600`, owner-only). Because the socket is created by the root-owned
+connect process, those subcommands also need `sudo`:
+
+```bash
+sudo pgn status
+sudo pgn disconnect
+```
+
+Both support `--json` for machine-readable output.
 
 ---
 
@@ -203,7 +215,7 @@ policy. We never reimplement ESP/UDP, never shell out to the
 
 ### Phase 2 — next
 
-- `pgn status` / `pgn disconnect` via unix socket
+- ~~`pgn status` / `pgn disconnect` via unix socket~~ ✅
 - HIP report generation (`gp-hip`)
 - Native route + DNS management (`gp-route` / `gp-dns`) — replace the
   bundled vpnc-script entirely with rtnetlink + systemd-resolved /

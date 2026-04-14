@@ -9,6 +9,7 @@ members = [
     "crates/gp-dns",
     "crates/gp-route",
     "crates/gp-config",
+    "crates/gp-ipc",
     "bins/pgn",
     "bins/pgn-auth-helper",
 ]
@@ -32,6 +33,7 @@ gp-hip = { path = "crates/gp-hip" }
 gp-dns = { path = "crates/gp-dns" }
 gp-route = { path = "crates/gp-route" }
 gp-config = { path = "crates/gp-config" }
+gp-ipc = { path = "crates/gp-ipc" }
 
 # Async
 tokio = { version = "1", features = ["full"] }

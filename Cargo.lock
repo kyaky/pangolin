@@ -877,6 +877,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gp-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "gp-openconnect-sys"
 version = "0.1.0"
 dependencies = [
@@ -1674,9 +1686,11 @@ dependencies = [
  "gp-config",
  "gp-dns",
  "gp-hip",
+ "gp-ipc",
  "gp-proto",
  "gp-route",
  "gp-tunnel",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

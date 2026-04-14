@@ -1,0 +1,15 @@
+[package]
+name = "gp-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IPC protocol + client/server helpers for pgn CLI <-> running session"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"

@@ -1,11 +1,19 @@
 //! `pgn` — Pangolin GlobalProtect VPN CLI.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use gp_auth::{
     AuthContext, AuthProvider, GpClient, PasswordAuthProvider, SamlBrowserAuthProvider,
     SamlPasteAuthProvider,
+};
+use gp_ipc::{
+    bind_server, build_snapshot, client_roundtrip, read_request, write_response, IpcError,
+    Request as IpcRequest, Response as IpcResponse, StateSnapshotBase, DEFAULT_SOCKET_PATH,
 };
 use gp_proto::{AuthCookie, ClientOs, GatewayLoginResult, GpParams};
 use gp_tunnel::OpenConnectSession;
@@ -125,14 +133,101 @@ async fn main() -> Result<()> {
             })
             .await
         }
-        Some(Commands::Disconnect) => {
-            tracing::info!("disconnect: not yet implemented (Task 1.5)");
+        Some(Commands::Disconnect) => disconnect(cli.json).await,
+        Some(Commands::Status) | None => status(cli.json).await,
+    }
+}
+
+/// Where the running session keeps its control socket. Kept as a
+/// `PathBuf` so tests can override it in the future.
+fn control_socket_path() -> PathBuf {
+    PathBuf::from(DEFAULT_SOCKET_PATH)
+}
+
+/// `pgn status` — query the running session (if any) and pretty-print.
+async fn status(json: bool) -> Result<()> {
+    let path = control_socket_path();
+    match client_roundtrip(&path, &IpcRequest::Status).await {
+        Ok(IpcResponse::Status(s)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&s).unwrap_or_else(|_| "{}".into())
+                );
+            } else {
+                let mins = s.uptime_seconds / 60;
+                let secs = s.uptime_seconds % 60;
+                println!("state:     connected");
+                println!("portal:    {}", s.portal);
+                println!("gateway:   {}", s.gateway);
+                println!("user:      {}", s.user);
+                println!("os-spoof:  {}", s.reported_os);
+                println!("uptime:    {}m{}s", mins, secs);
+                if s.routes.is_empty() {
+                    println!("routes:    (default — script-managed)");
+                } else {
+                    println!("routes:    {}", s.routes.join(", "));
+                }
+            }
             Ok(())
         }
-        Some(Commands::Status) | None => {
-            println!("pgn {} — not connected", env!("CARGO_PKG_VERSION"));
+        Ok(IpcResponse::Error { message }) => {
+            anyhow::bail!("server error: {message}");
+        }
+        Ok(IpcResponse::Ok) => {
+            anyhow::bail!("server returned Ok to a Status request — protocol bug");
+        }
+        Err(IpcError::NotRunning(_)) => {
+            if json {
+                println!(r#"{{"state":"disconnected"}}"#);
+            } else {
+                println!("state:     disconnected");
+            }
             Ok(())
         }
+        Err(IpcError::PermissionDenied(_)) => {
+            anyhow::bail!(
+                "control socket exists but you don't have permission to read it — \
+                 try `sudo pgn status`"
+            );
+        }
+        Err(e) => Err(anyhow::anyhow!(e).context("querying pgn status")),
+    }
+}
+
+/// `pgn disconnect` — ask the running session to tear down.
+async fn disconnect(json: bool) -> Result<()> {
+    let path = control_socket_path();
+    match client_roundtrip(&path, &IpcRequest::Disconnect).await {
+        Ok(IpcResponse::Ok) => {
+            if json {
+                println!(r#"{{"result":"disconnect-requested"}}"#);
+            } else {
+                println!("disconnect requested");
+            }
+            Ok(())
+        }
+        Ok(IpcResponse::Error { message }) => {
+            anyhow::bail!("server error: {message}");
+        }
+        Ok(IpcResponse::Status(_)) => {
+            anyhow::bail!("server returned Status to a Disconnect request — protocol bug");
+        }
+        Err(IpcError::NotRunning(_)) => {
+            if json {
+                println!(r#"{{"result":"not-running"}}"#);
+            } else {
+                println!("no running pgn session");
+            }
+            Ok(())
+        }
+        Err(IpcError::PermissionDenied(_)) => {
+            anyhow::bail!(
+                "control socket exists but you don't have permission to read it — \
+                 try `sudo pgn disconnect`"
+            );
+        }
+        Err(e) => Err(anyhow::anyhow!(e).context("requesting pgn disconnect")),
     }
 }
 
@@ -378,7 +473,29 @@ async fn connect(args: ConnectArgs) -> Result<()> {
         .recv()
         .context("tunnel thread failed before signalling readiness")?;
 
-    tracing::info!("tunnel running — press Ctrl-C to disconnect");
+    // Spawn the IPC server so `pgn status` / `pgn disconnect` from another
+    // shell can talk to this session.
+    let ipc_base = StateSnapshotBase {
+        portal: portal_url.clone(),
+        gateway: gateway.address.clone(),
+        user: auth_cookie.username.clone(),
+        reported_os: oc_os.to_string(),
+        routes: routes.clone(),
+    };
+    let ipc_start = Instant::now();
+    let (ipc_disconnect_tx, mut ipc_disconnect_rx) =
+        tokio::sync::oneshot::channel::<()>();
+    let ipc_socket_path = control_socket_path();
+    let ipc_handle = spawn_ipc_server(
+        ipc_socket_path.clone(),
+        Arc::new(ipc_base),
+        ipc_start,
+        ipc_disconnect_tx,
+    )
+    .await
+    .context("starting ipc server")?;
+
+    tracing::info!("tunnel running — press Ctrl-C (or `pgn disconnect`) to tear down");
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -387,14 +504,26 @@ async fn connect(args: ConnectArgs) -> Result<()> {
                 tracing::warn!("cancel failed: {e}");
             }
         }
+        _ = &mut ipc_disconnect_rx => {
+            tracing::info!("disconnect request received via control socket, cancelling tunnel...");
+            if let Err(e) = cancel_handle.cancel() {
+                tracing::warn!("cancel failed: {e}");
+            }
+        }
         res = &mut done_rx => {
             // Tunnel exited on its own.
+            ipc_handle.abort();
+            let _ = std::fs::remove_file(&ipc_socket_path);
             return match res {
                 Ok(r) => r,
                 Err(_) => Err(anyhow::anyhow!("tunnel thread panicked")),
             };
         }
     }
+
+    // Shut the IPC server down now that we're on the exit path.
+    ipc_handle.abort();
+    let _ = std::fs::remove_file(&ipc_socket_path);
 
     // Wait for the tunnel thread to clean up.
     let res = done_rx.await.context("tunnel thread did not report exit")?;
@@ -426,6 +555,72 @@ fn build_openconnect_cookie(c: &AuthCookie) -> String {
         parts.push(format!("preferred-ip={ip}"));
     }
     parts.join("&")
+}
+
+/// Spawn the IPC server on a tokio task. Returns a `JoinHandle` so the
+/// caller can `abort()` it on tunnel teardown.
+///
+/// The server owns the `UnixListener` and an `Arc<StateSnapshotBase>`.
+/// On every connection it reads a single JSON request and writes a
+/// single JSON response. A `Disconnect` request is forwarded exactly
+/// once to `disconnect_tx` — subsequent `Disconnect` requests reply `Ok`
+/// without firing again.
+async fn spawn_ipc_server(
+    path: PathBuf,
+    base: Arc<StateSnapshotBase>,
+    started_at: Instant,
+    disconnect_tx: tokio::sync::oneshot::Sender<()>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let listener = bind_server(&path)
+        .await
+        .with_context(|| format!("binding control socket at {}", path.display()))?;
+    tracing::info!("control socket listening on {}", path.display());
+
+    // The disconnect sender is consumed on first use. `Arc<Mutex<Option<..>>>`
+    // lets multiple concurrent status requests coexist with an eventual
+    // single disconnect request without panicking.
+    let disconnect_tx = Arc::new(tokio::sync::Mutex::new(Some(disconnect_tx)));
+
+    Ok(tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("control socket accept failed: {e}");
+                    continue;
+                }
+            };
+            let base = Arc::clone(&base);
+            let disconnect_tx = Arc::clone(&disconnect_tx);
+            tokio::spawn(async move {
+                if let Err(e) = handle_ipc_client(stream, base, started_at, disconnect_tx).await {
+                    tracing::debug!("control socket client error: {e}");
+                }
+            });
+        }
+    }))
+}
+
+/// Handle one client connection: one request, one response, close.
+async fn handle_ipc_client(
+    mut stream: tokio::net::UnixStream,
+    base: Arc<StateSnapshotBase>,
+    started_at: Instant,
+    disconnect_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) -> Result<(), IpcError> {
+    let req = read_request(&mut stream).await?;
+    let resp = match req {
+        IpcRequest::Status => IpcResponse::Status(build_snapshot(&base, started_at)),
+        IpcRequest::Disconnect => {
+            let mut slot = disconnect_tx.lock().await;
+            if let Some(tx) = slot.take() {
+                let _ = tx.send(());
+            }
+            IpcResponse::Ok
+        }
+    };
+    write_response(&mut stream, &resp).await?;
+    Ok(())
 }
 
 /// Map the pangolin `--os` flag to the string libopenconnect expects for
