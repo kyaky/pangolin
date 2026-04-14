@@ -24,57 +24,53 @@
 /// is: take the cookie query string the caller already built for
 /// libopenconnect, drop the three fields that libopenconnect
 /// treats as session-local (`authcookie`, `preferred-ip`,
-/// `preferred-ipv6`), re-serialize the remainder in the same
-/// `key=value&key=value` form, MD5-hash the result, and
+/// `preferred-ipv6`), re-serialize the remainder in canonical
+/// `application/x-www-form-urlencoded` form (percent-decode on
+/// input, percent-encode on output), MD5-hash the result, and
 /// lowercase-hex-encode it.
+///
+/// The round-trip through `serde_urlencoded` matters: the
+/// reference client normalises percent-escapes and reserved
+/// characters via this route, and the gateway validates the hash
+/// against its own `serde_urlencoded`-style encoder. A raw
+/// `split('&').split('=')` approach would silently diverge on
+/// any cookie value containing `%`, `&`, or `=`, and the
+/// resulting MD5 mismatch would be rejected by the HIP check
+/// without any visible error on our side.
 ///
 /// Note that this is MD5 and weak by any modern metric. Pangolin
 /// does not use it for authentication — the value is only
 /// forwarded to the gateway as a "did the cookie change" marker.
 /// We accept the legacy hash so the protocol still interoperates.
 pub fn compute_csd_md5(cookie: &str) -> String {
-    let filtered = filter_cookie_fields(cookie);
-    let serialized = serialize_cookie_fields(&filtered);
+    // Parse with serde_urlencoded so percent-escapes are decoded
+    // into their literal bytes in Rust-side Strings. An unparseable
+    // cookie falls back to an empty field list — the resulting
+    // empty-string MD5 is harmless, and the subsequent hip check
+    // request will fail loudly on the real `authcookie`-less
+    // cookie anyway.
+    let mut fields: Vec<(String, String)> =
+        serde_urlencoded::from_str(cookie).unwrap_or_default();
+    const DROP: [&str; 3] = ["authcookie", "preferred-ip", "preferred-ipv6"];
+    fields.retain(|(k, _)| !DROP.contains(&k.as_str()));
+    // Re-serialize through the same library so percent-encoding
+    // matches byte-for-byte what the gateway sees.
+    let serialized = serde_urlencoded::to_string(&fields).unwrap_or_default();
     let digest = md5::compute(serialized.as_bytes());
     format!("{:x}", digest)
 }
 
-/// Parse an ampersand-separated `key=value` cookie string into
-/// owned tuples, dropping the three entries that must not
-/// participate in the MD5.
-fn filter_cookie_fields(cookie: &str) -> Vec<(String, String)> {
-    const DROP: [&str; 3] = ["authcookie", "preferred-ip", "preferred-ipv6"];
-    cookie
-        .split('&')
-        .filter_map(|entry| entry.split_once('='))
-        .filter(|(k, _)| !DROP.contains(k))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-fn serialize_cookie_fields(fields: &[(String, String)]) -> String {
-    let mut out = String::new();
-    for (i, (k, v)) in fields.iter().enumerate() {
-        if i > 0 {
-            out.push('&');
-        }
-        out.push_str(k);
-        out.push('=');
-        out.push_str(v);
-    }
-    out
-}
-
-/// Turn a cookie query string into `Vec<(&str, String)>` tuples
-/// suitable for merging into a reqwest form body. Unlike
-/// [`filter_cookie_fields`], this retains every field including
+/// Turn a cookie query string into `Vec<(String, String)>`
+/// tuples suitable for merging into a reqwest form body. Unlike
+/// [`compute_csd_md5`], this retains every field including
 /// `authcookie` — the HIP endpoints want the full set.
+///
+/// Values are percent-decoded during parse, matching yuezk's
+/// approach. `reqwest::RequestBuilder::form` will re-encode them
+/// before hitting the wire, so the final request body is byte-
+/// identical to what the reference client sends.
 pub fn cookie_to_form_fields(cookie: &str) -> Vec<(String, String)> {
-    cookie
-        .split('&')
-        .filter_map(|entry| entry.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+    serde_urlencoded::from_str(cookie).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -85,17 +81,28 @@ mod tests {
     fn md5_drops_authcookie_and_preferred_ip() {
         let cookie = "authcookie=ABC&portal=p.example.com&user=alice&preferred-ip=10.1.2.3";
         let md5 = compute_csd_md5(cookie);
-        // Expected hash of the serialized remainder
-        // "portal=p.example.com&user=alice".
-        let expected = format!("{:x}", md5::compute("portal=p.example.com&user=alice"));
+        // Hash is taken over the serde_urlencoded-serialized
+        // remainder. We compute the expected value through the
+        // same round trip so the test tracks the real encoding
+        // contract rather than a hand-rolled string.
+        let expected_fields: Vec<(String, String)> = vec![
+            ("portal".into(), "p.example.com".into()),
+            ("user".into(), "alice".into()),
+        ];
+        let expected_serialized = serde_urlencoded::to_string(&expected_fields).unwrap();
+        let expected = format!("{:x}", md5::compute(expected_serialized.as_bytes()));
         assert_eq!(md5, expected);
     }
 
     #[test]
     fn md5_drops_preferred_ipv6() {
+        // The preferred-ipv6 value is percent-encoded. After the
+        // round trip, the remainder should only be `user=u`, and
+        // the MD5 should match the round-trip encoding of that.
         let cookie = "authcookie=X&user=u&preferred-ipv6=%3A%3A1";
         let md5 = compute_csd_md5(cookie);
-        let expected = format!("{:x}", md5::compute("user=u"));
+        let expected_serialized = serde_urlencoded::to_string([("user", "u")]).unwrap();
+        let expected = format!("{:x}", md5::compute(expected_serialized.as_bytes()));
         assert_eq!(md5, expected);
     }
 
@@ -108,18 +115,42 @@ mod tests {
     }
 
     #[test]
-    fn filter_preserves_order() {
-        let cookie = "portal=p&authcookie=X&user=u&domain=D&preferred-ip=1.2.3.4&computer=C";
-        let fields = filter_cookie_fields(cookie);
-        assert_eq!(
-            fields,
-            vec![
-                ("portal".to_string(), "p".to_string()),
-                ("user".to_string(), "u".to_string()),
-                ("domain".to_string(), "D".to_string()),
-                ("computer".to_string(), "C".to_string()),
-            ]
+    fn md5_canonicalizes_percent_escapes() {
+        // Two logically identical cookies that differ only in
+        // whether a value was percent-encoded on input. After
+        // round-tripping through serde_urlencoded, both should
+        // produce the same MD5 — this is the failure mode the
+        // raw-split implementation would miss.
+        let decoded_cookie = "authcookie=Z&user=a b";
+        let encoded_cookie = "authcookie=Z&user=a%20b";
+        // Note: the `+` form is also valid url-encoded whitespace
+        // and commonly appears. Include it too.
+        let plus_cookie = "authcookie=Z&user=a+b";
+        let m1 = compute_csd_md5(decoded_cookie);
+        let m2 = compute_csd_md5(encoded_cookie);
+        let m3 = compute_csd_md5(plus_cookie);
+        assert_eq!(m1, m2, "decoded vs %-encoded diverged");
+        assert_eq!(m1, m3, "decoded vs +-encoded diverged");
+    }
+
+    #[test]
+    fn md5_handles_reserved_chars_via_encoding() {
+        // A cookie value containing a literal `=` or `&` must be
+        // percent-encoded on the wire. If someone built such a
+        // cookie and fed it to us as already-encoded, we should
+        // decode it on parse and re-encode it on serialize, so
+        // the MD5 matches what the gateway would compute.
+        let cookie = "authcookie=X&user=a%3Db"; // user = "a=b"
+        let md5 = compute_csd_md5(cookie);
+        let expected = format!(
+            "{:x}",
+            md5::compute(
+                serde_urlencoded::to_string([("user", "a=b")])
+                    .unwrap()
+                    .as_bytes()
+            )
         );
+        assert_eq!(md5, expected);
     }
 
     #[test]
@@ -133,11 +164,15 @@ mod tests {
     }
 
     #[test]
-    fn cookie_to_form_fields_ignores_malformed_entries() {
-        // "garbage" has no '=' so it's dropped silently — matches
-        // yuezk / serde_urlencoded behaviour.
-        let cookie = "authcookie=X&garbage&user=u";
+    fn cookie_to_form_fields_percent_decodes_values() {
+        // `%20` should round-trip into a Rust-side " " so that
+        // reqwest's form encoder re-encodes it canonically on
+        // the wire.
+        let cookie = "user=alice+smith&email=foo%40example.com";
         let fields = cookie_to_form_fields(cookie);
         assert_eq!(fields.len(), 2);
+        // serde_urlencoded decodes `+` as ' ' per form-url spec.
+        assert_eq!(fields[0].1, "alice smith");
+        assert_eq!(fields[1].1, "foo@example.com");
     }
 }

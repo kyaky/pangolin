@@ -1220,3 +1220,56 @@ fn run_tunnel(
     run_res.context("openconnect mainloop")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_unix_epoch() {
+        assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn civil_from_unix_new_years_2025() {
+        // 2025-01-01 00:00:00 UTC = 1_735_689_600.
+        assert_eq!(
+            civil_from_unix(1_735_689_600),
+            (2025, 1, 1, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn civil_from_unix_mid_day() {
+        // 2024-06-15 12:34:56 UTC
+        //   days from epoch to 2024-06-15 = 19889 → 1_718_409_600
+        //   + 12h → 1_718_452_800
+        //   + 34m → 1_718_454_840
+        //   + 56s → 1_718_454_896
+        assert_eq!(
+            civil_from_unix(1_718_454_896),
+            (2024, 6, 15, 12, 34, 56)
+        );
+    }
+
+    #[test]
+    fn civil_from_unix_leap_day_2024() {
+        // 2024-02-29 00:00:00 UTC = 1_709_164_800.
+        assert_eq!(
+            civil_from_unix(1_709_164_800),
+            (2024, 2, 29, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn generate_time_has_expected_shape() {
+        let s = gp_hip_generate_time();
+        // "MM/DD/YYYY HH:MM:SS" = 19 chars.
+        assert_eq!(s.len(), 19);
+        assert!(s.as_bytes()[2] == b'/');
+        assert!(s.as_bytes()[5] == b'/');
+        assert!(s.as_bytes()[10] == b' ');
+        assert!(s.as_bytes()[13] == b':');
+        assert!(s.as_bytes()[16] == b':');
+    }
+}

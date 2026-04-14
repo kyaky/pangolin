@@ -107,6 +107,16 @@ impl GpClient {
         params.push(("protocol-version".to_string(), "p1".to_string()));
         params.push(("internal".to_string(), "no".to_string()));
         params.push(("ipv6-support".to_string(), "yes".to_string()));
+        // Match yuezk's reference client's algo advertisements.
+        // We don't actually negotiate ESP / DTLS ourselves —
+        // libopenconnect redoes getconfig internally and handles
+        // that — but the gateway expects these fields and some
+        // deployments reject POSTs that omit them.
+        params.push(("hmac-algo".to_string(), "sha1,md5,sha256".to_string()));
+        params.push((
+            "enc-algo".to_string(),
+            "aes-128-cbc,aes-256-cbc".to_string(),
+        ));
 
         tracing::debug!("gateway getconfig POST {url}");
         let body = self

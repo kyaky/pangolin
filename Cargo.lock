@@ -841,6 +841,7 @@ dependencies = [
  "libc",
  "md5",
  "reqwest",
+ "serde_urlencoded",
  "soup3",
  "thiserror 1.0.69",
  "tokio",
