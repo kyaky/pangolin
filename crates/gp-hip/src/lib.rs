@@ -472,22 +472,21 @@ fn detect_machine_id() -> Option<String> {
 ///
 ///   * 32 hex chars with no dashes → formatted into
 ///     `"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"`
-///   * 36-char input that already contains dashes, provided the
-///     non-dash characters are all hex → returned lowercased
+///   * a 36-char input in *canonical* UUID layout — hex blocks of
+///     length 8, 4, 4, 4, 12 separated by dashes at positions
+///     8, 13, 18, 23. Returned lowercased.
 ///
 /// Returns `None` for any other shape (wrong length, non-hex
-/// characters, etc.) so the caller can fall through to a safe
-/// placeholder instead of forwarding garbage.
+/// characters, dashes in non-canonical positions, etc.) so the
+/// caller can fall through to a safe placeholder instead of
+/// forwarding garbage.
 fn format_as_uuid(raw: &str) -> Option<String> {
     let lower = raw.to_ascii_lowercase();
     if lower.contains('-') {
-        if lower.len() != 36 {
+        if !is_canonical_uuid(&lower) {
             return None;
         }
-        if lower.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
-            return Some(lower);
-        }
-        return None;
+        return Some(lower);
     }
     if lower.len() != 32 {
         return None;
@@ -503,6 +502,27 @@ fn format_as_uuid(raw: &str) -> Option<String> {
         &lower[16..20],
         &lower[20..32]
     ))
+}
+
+/// Whether `s` is a lowercase 36-char UUID in the canonical
+/// `8-4-4-4-12` layout with hex everywhere except the four fixed
+/// dash positions.
+fn is_canonical_uuid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    // Canonical dash positions.
+    const DASH_POSITIONS: [usize; 4] = [8, 13, 18, 23];
+    for (i, b) in s.bytes().enumerate() {
+        if DASH_POSITIONS.contains(&i) {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -649,6 +669,24 @@ mod tests {
     fn format_as_uuid_rejects_wrong_length_dashed() {
         // 37 characters with dashes — rejected.
         assert!(format_as_uuid("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeeef").is_none());
+    }
+
+    #[test]
+    fn format_as_uuid_rejects_noncanonical_dash_placement() {
+        // 36 chars, only hex + dashes, but dashes are in the wrong
+        // positions. Canonical layout requires dashes at 8, 13,
+        // 18, 23. Both of these are 36 chars of pure [hex|-] and
+        // would have passed the round-7 implementation.
+        assert!(format_as_uuid("----aaaa-bbbb-cccc-dddd-eeeeeeeeeeee").is_none());
+        assert!(format_as_uuid("aaaa-aaaabbbbccccddddeeeeeeeeeeee-aa").is_none());
+    }
+
+    #[test]
+    fn format_as_uuid_accepts_canonical_mixed_case() {
+        assert_eq!(
+            format_as_uuid("12345678-90AB-CDEF-1234-567890abcdef").as_deref(),
+            Some("12345678-90ab-cdef-1234-567890abcdef")
+        );
     }
 
     #[test]
