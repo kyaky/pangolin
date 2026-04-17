@@ -56,7 +56,7 @@ jobs:
           tar -czf openprotect-cli-linux-x86_64.tar.gz -C dist .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openprotect-cli-linux-x86_64
           path: openprotect-cli-linux-x86_64.tar.gz
@@ -185,13 +185,13 @@ jobs:
           Compress-Archive -Path openprotect-gui-win\* -DestinationPath openprotect-gui-windows-x86_64.zip -Force
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openprotect-cli-windows-x86_64
           path: openprotect-cli-windows-x86_64.zip
 
       - name: Upload GUI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openprotect-gui-windows-x86_64
           path: openprotect-gui-windows-x86_64.zip
